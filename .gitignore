@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+chroma_data/
+*.db
+
+# Node
+node_modules/
+dist/
+.DS_Store
+.vscode/
+.next/
+out/
+build/
+*.log
+
+# Workspace
+.gemini/
+.agents/

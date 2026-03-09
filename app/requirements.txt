@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+pydantic
+python-multipart
+google-genai
+chromadb
+umap-learn
+scikit-learn
+numpy<2.0
+python-dotenv
+networkx
+sentence-transformers
+pdfminer.six
