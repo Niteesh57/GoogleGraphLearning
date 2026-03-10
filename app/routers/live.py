@@ -73,7 +73,39 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
                         },
                         required=["query"]
                     )
-                )
+                ),
+                types.FunctionDeclaration(
+                    name="create_mind_map",
+                    description=(
+                        "Create and display a visual mind map on the user's screen. "
+                        "Call this when the user asks to 'create a mind map', 'make a map', "
+                        "'show me a mind map', or 'visualize' any topic as a mind map."
+                    ),
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "title": types.Schema(
+                                type=types.Type.STRING,
+                                description="The central topic of the mind map."
+                            ),
+                            "nodes": types.Schema(
+                                type=types.Type.ARRAY,
+                                description="All nodes in the mind map, including the root and all branches.",
+                                items=types.Schema(
+                                    type=types.Type.OBJECT,
+                                    properties={
+                                        "id": types.Schema(type=types.Type.STRING, description="Unique node identifier (e.g. 'supervised_learning')"),
+                                        "label": types.Schema(type=types.Type.STRING, description="Display label shown on the node"),
+                                        "parent": types.Schema(type=types.Type.STRING, description="ID of the parent node. Use 'root' for top-level branches. Omit or null for the root node itself."),
+                                        "description": types.Schema(type=types.Type.STRING, description="1-2 sentence explanation shown when the user clicks this node."),
+                                    },
+                                    required=["id", "label"]
+                                )
+                            ),
+                        },
+                        required=["title", "nodes"]
+                    )
+                ),
             ]
         )],
         response_modalities=["AUDIO"],
@@ -93,23 +125,43 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
                 "  just announce it: 'You moved to [node]. It connects to [neighbor1] and [neighbor2].' Then stop. "
                 "- If the user asks a question, answer it directly in 1-2 sentences and stop. "
                 "- If the user says 'wait', 'hold on', 'stop', or interrupts — stop speaking immediately. "
-                "- Be natural and conversational, like a tutor sitting beside the user."
+                "- Be natural and conversational, like a tutor sitting beside the user. "
+                "MIND MAP RULES: "
+                "- If the user asks to create, make, show, or visualize a mind map about any topic, "
+                "  first say 'Let me build that for you...' and briefly speak your reasoning about "
+                "  the structure out loud as you think of it. Then call the create_mind_map tool "
+                "  with 6-12 well-described nodes. "
+                "- IMPORTANT: After the map appears, you MUST explain the structure of the map. "
+                "  Clearly explain what the nodes are and how they are related to each other conversationally. "
+                "  DO NOT use any Markdown formatting, bolding, or bullet points, as this is a spoken conversation. "
+                "- The root node should have id='root' and no parent field."
             )
         )])
     )
+
 
     try:
         async with client.aio.live.connect(model=LIVE_MODEL, config=config) as session:
             logging.info(f"Successfully connected to Gemini Live with model: {LIVE_MODEL}")
 
+            # ── TOOL GATEKEEPER ────────────────────────────────────────────────────
+            # asyncio.Event starts "set" (open). While a tool_call is in flight,
+            # we clear() it so receive_from_client blocks instead of sending audio.
+            # After the tool_response is sent, we set() it again to resume audio.
+            tool_gate = asyncio.Event()
+            tool_gate.set()  # Open by default — audio flows freely
+            # ──────────────────────────────────────────────────────────────────────
+
             async def receive_from_client():
-                """Forward frontend audio/images to Gemini."""
+                """Forward frontend audio/images to Gemini, gated by tool_gate."""
                 try:
                     while True:
                         data = await websocket.receive_text()
                         msg = json.loads(data)
 
                         if "realtimeInput" in msg:
+                            # Wait until any in-flight tool call has been resolved
+                            await tool_gate.wait()
                             chunks = msg["realtimeInput"]["mediaChunks"]
                             for chunk in chunks:
                                 mime_type = chunk["mimeType"]
@@ -117,7 +169,7 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
                                 await session.send(input={"mime_type": mime_type, "data": raw_bytes})
 
                         if "clientContent" in msg:
-                            # Text context message (e.g. node description)
+                            # Text context messages (e.g. node description) are always safe
                             await session.send(
                                 input=types.LiveClientContent(**msg["clientContent"])
                             )
@@ -125,7 +177,8 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
                 except WebSocketDisconnect:
                     logging.info("Frontend WebSocket disconnected normally.")
                 except Exception as e:
-                    logging.error(f"Error in receive_from_client: {e}")
+                    import traceback
+                    logging.error(f"Error in receive_from_client: {e}\n{traceback.format_exc()}")
 
             async def receive_from_gemini():
                 """Relay Gemini responses and tool calls back to frontend."""
@@ -138,36 +191,70 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
                             if chunk.server_content and chunk.server_content.interrupted:
                                 logging.info("Gemini interrupted — signalling frontend to flush.")
                                 await websocket.send_json({"interrupted": True})
-                                # Don't continue — still process tool calls / text in same chunk
 
-                            # 2. Handle Tool Calls
+                            # 2. Handle Tool Calls — CLOSE the gate while tool is pending
                             if chunk.tool_call:
-                                for call in chunk.tool_call.function_calls:
-                                    if call.name == "search_concept":
-                                        result = search_concept(**call.args)
-                                        await session.send(
-                                            input=types.LiveClientToolResponse(
-                                                function_responses=[types.FunctionResponse(
-                                                    name=call.name,
-                                                    id=call.id,
-                                                    response=result
-                                                )]
-                                            )
-                                        )
+                                tool_gate.clear()  # Stop audio forwarding immediately
+                                logging.info(f"Tool call received — gate CLOSED. Tools: {[c.name for c in chunk.tool_call.function_calls]}")
+                                try:
+                                    responses = []
+                                    for call in chunk.tool_call.function_calls:
+                                        if call.name == "search_concept":
+                                            result = search_concept(**call.args)
 
-                            # 3. Audio — forward PCM audio to the frontend
-                            if chunk.data:
+                                        elif call.name == "create_mind_map":
+                                            # Forward the full map data to React immediately
+                                            logging.info(f"create_mind_map called: title='{call.args.get('title')}'")
+                                            await websocket.send_json({
+                                                "type": "mind_map",
+                                                "data": dict(call.args)
+                                            })
+                                            # ACK Gemini instantly so it can resume speaking
+                                            result = {
+                                                "status": "success",
+                                                "message": "Mind map has been rendered on the user's screen."
+                                            }
+
+                                        else:
+                                            result = {"error": f"Unknown tool: {call.name}"}
+
+                                        responses.append(types.FunctionResponse(
+                                            name=call.name,
+                                            id=call.id,
+                                            response=result
+                                        ))
+                                    # Send all tool responses in one batch
+                                    await session.send(
+                                        input=types.LiveClientToolResponse(function_responses=responses)
+                                    )
+                                    logging.info("Tool responses sent — gate OPEN.")
+                                finally:
+                                    tool_gate.set()  # Re-open gate whether or not tool succeeded
+
+                            # 3 & 4. Extract Audio and Text from model_turn.parts (SDK v1+)
+                            #  chunk.data and chunk.text are NOT set on the root — they live inside
+                            #  server_content.model_turn.parts as inline_data / text parts.
+                            if chunk.server_content and chunk.server_content.model_turn:
+                                for part in chunk.server_content.model_turn.parts:
+                                    if part.inline_data and part.inline_data.data:
+                                        audio_b64 = base64.b64encode(part.inline_data.data).decode("utf-8")
+                                        await websocket.send_json({"audio": audio_b64})
+                                    if part.text:
+                                        await websocket.send_json({"text": part.text})
+
+                            # Fallback: some model variants send audio at chunk.data directly
+                            elif chunk.data:
                                 audio_b64 = base64.b64encode(chunk.data).decode("utf-8")
                                 await websocket.send_json({"audio": audio_b64})
-
-                            # 4. Text transcript
-                            if chunk.text:
+                            elif chunk.text:
                                 await websocket.send_json({"text": chunk.text})
 
                 except asyncio.CancelledError:
                     logging.info("receive_from_gemini task was cancelled.")
                 except Exception as e:
-                    logging.error(f"Error in receive_from_gemini: {e}")
+                    import traceback
+                    logging.error(f"Error in receive_from_gemini: {e}\n{traceback.format_exc()}")
+
 
             # Run tasks; stop both the moment either finishes
             done, pending = await asyncio.wait(
@@ -177,6 +264,7 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
             )
             for task in pending:
                 task.cancel()
+
 
     except Exception as e:
         logging.error(f"WebSocket session ended: {e}")

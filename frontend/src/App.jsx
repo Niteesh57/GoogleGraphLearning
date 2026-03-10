@@ -1,11 +1,12 @@
 import { useState, useCallback, useRef, useEffect } from 'react';
+import ReactMarkdown from 'react-markdown';
 import GraphView from './components/GraphView';
 import PDFUploader from './components/PDFUploader';
 import TextConceptInput from './components/TextConceptInput';
 import LiveAssistant from './components/LiveAssistant';
-import NodeInspector from './components/NodeInspector';
 import GestureController from './components/GestureController';
 import ProcessingOverlay from './components/ProcessingOverlay';
+import MindMapViewer from './components/MindMapViewer';
 import './index.css';
 
 // Mock data to ensure react-force-graph renders correctly
@@ -31,9 +32,20 @@ function App() {
   const [geminiExplanation, setGeminiExplanation] = useState("");
   const [isProcessing, setIsProcessing] = useState(false);
   const [processingFile, setProcessingFile] = useState(null);
+  const [mindMapData, setMindMapData] = useState(null);
+  const [mindMapHistory, setMindMapHistory] = useState([]);
+  
   const fgRef = useRef();
   const leftPanelRef = useRef();
+  const geminiTextEndRef = useRef(null);
   const [graphSize, setGraphSize] = useState({ width: 700, height: 500 });
+
+  // Auto-scroll Gemini explanation when new text arrives
+  useEffect(() => {
+    if (geminiTextEndRef.current) {
+      geminiTextEndRef.current.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [geminiExplanation]);
 
   // Measure left panel and keep graph canvas sized to fill it exactly
   useEffect(() => {
@@ -136,40 +148,6 @@ function App() {
       .catch(err => console.error("Could not fetch graph data", err));
   }, [selectedNode, handleNodeSelect]);
 
-  const handleAskGeminiRaw = async (audioOrNode, maybeNode) => {
-    // Determine arguments (VoiceAssistant passes (blob, node), NodeInspector passes (node))
-    const isBlob = audioOrNode instanceof Blob;
-    const node = isBlob ? maybeNode : audioOrNode;
-    const audioBlob = isBlob ? audioOrNode : null;
-
-    if (!node) return;
-
-    if (!audioBlob) {
-      setGeminiExplanation(`Please use the Live Assistant or Voice panel to talk about ${node.id}.`);
-      return;
-    }
-    setGeminiExplanation(`Transcribing and analyzing audio query for ${node.id}...`);
-    try {
-      const formData = new FormData();
-      formData.append('audio', audioBlob, 'query.webm');
-      formData.append('nodeId', node.id);
-
-      const response = await fetch('http://localhost:8000/api/explain-node-voice', {
-        method: 'POST',
-        body: formData
-      });
-      const data = await response.json();
-      setGeminiExplanation(data.explanation || "Gemini provided an explanation here.");
-    } catch (e) {
-      console.warn("Backend not connected yet or error occurred");
-      setGeminiExplanation(`Error communicating with Gemini audio service.`);
-    }
-  };
-
-  const handleAskGemini = async (node) => {
-    console.warn("handleAskGemini called but depreciated. Please use Voice controls.");
-  };
-
 
   return (
     <div className="app-layout">
@@ -187,7 +165,7 @@ function App() {
       </header>
       
       <div className="main-content">
-        <div className="left-panel" ref={leftPanelRef}>
+        <div className="left-panel" ref={leftPanelRef} style={{ position: 'relative' }}>
            <GraphView 
              ref={fgRef}
              data={graphData} 
@@ -196,6 +174,13 @@ function App() {
              width={graphSize.width}
              height={graphSize.height}
            />
+           {/* Mind map overlay — rendered on top of the 3D graph */}
+           {mindMapData && (
+             <MindMapViewer
+               mapData={mindMapData}
+               onClose={() => setMindMapData(null)}
+             />
+           )}
         </div>
 
         <div className="right-panel">
@@ -214,14 +199,55 @@ function App() {
           </div>
 
           <div className="middle-inspector">
-             <NodeInspector 
-               selectedNode={selectedNode} 
-               onAskGemini={handleAskGeminiRaw} 
-             />
-             {geminiExplanation && (
-               <div className="gemini-response">
-                 <h4>Gemini Explains:</h4>
-                 <p>{geminiExplanation}</p>
+             {/* Gemini Explanation box with auto-scroll */}
+             <div className="gemini-response" style={{ maxHeight: '200px', overflowY: 'auto' }}>
+               {geminiExplanation ? (
+                 <>
+                   <h4 style={{ margin: '0 0 8px 0', fontSize: '0.85rem', color: '#94a3b8' }}>Gemini Explains:</h4>
+                   <div style={{ fontSize: '0.9rem', lineHeight: 1.5, color: '#e2e8f0', wordBreak: 'break-word', paddingRight: '8px' }}>
+                     <ReactMarkdown>{geminiExplanation}</ReactMarkdown>
+                   </div>
+                   <div ref={geminiTextEndRef} />
+                 </>
+               ) : (
+                 <p style={{ margin: 0, color: '#64748b', fontStyle: 'italic', fontSize: '0.9rem' }}>
+                   Ask Gemini about a concept to see the explanation here...
+                 </p>
+               )}
+             </div>
+
+             {/* Mind Map History */}
+             {mindMapHistory.length > 0 && (
+               <div className="mind-map-history" style={{ 
+                 marginTop: '1rem', padding: '12px', background: 'rgba(255,255,255,0.03)', 
+                 borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)'
+               }}>
+                 <h4 style={{ margin: '0 0 10px 0', fontSize: '0.8rem', color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Mind Map History</h4>
+                 <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '160px', overflowY: 'auto' }}>
+                   {mindMapHistory.map((map, idx) => (
+                     <button
+                       key={idx}
+                       onClick={() => setMindMapData(map)}
+                       style={{
+                         background: 'transparent', border: '1px solid #475569',
+                         color: '#e2e8f0', padding: '8px 12px', borderRadius: '6px',
+                         textAlign: 'left', cursor: 'pointer', fontSize: '0.85rem',
+                         transition: 'all 0.2s', display: 'flex', alignItems: 'center', gap: '8px'
+                       }}
+                       onMouseEnter={e => {
+                         e.currentTarget.style.background = 'rgba(255,255,255,0.05)';
+                         e.currentTarget.style.borderColor = '#64748b';
+                       }}
+                       onMouseLeave={e => {
+                         e.currentTarget.style.background = 'transparent';
+                         e.currentTarget.style.borderColor = '#475569';
+                       }}
+                     >
+                       <span style={{ fontSize: '1rem', opacity: 0.8 }}>📄</span>
+                       <span>{map.title}</span>
+                     </button>
+                   ))}
+                 </div>
                </div>
              )}
           </div>
@@ -231,6 +257,15 @@ function App() {
                graphContainerRef={leftPanelRef}
                selectedNode={selectedNode}
                graphData={graphData}
+               onMindMapReceived={(data) => {
+                 setMindMapData(data);
+                 setMindMapHistory(prev => [data, ...prev]);
+               }}
+               onAudioFinished={() => {
+                  console.log("Audio finished! Auto-closing mind map in 1.5s...");
+                  // Keep it on screen for 1.5 seconds after speaking finishes before closing
+                  setTimeout(() => setMindMapData(null), 1500);
+               }}
                onTextReceived={(text) => {
                  setGeminiExplanation(prev => {
                    if (!prev || prev.includes("Transcribing")) return text;

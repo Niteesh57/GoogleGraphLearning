@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import * as base64js from 'base64-js';
 
-const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selectedNode, graphData }) => {
+const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, onMindMapReceived, onAudioFinished, selectedNode, graphData }) => {
   const [isConnected, setIsConnected] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [error, setError] = useState(null);
@@ -38,7 +38,6 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selec
   // To play back audio from Gemini
   const playbackContextRef = useRef(null);
   const playbackQueueRef = useRef([]);
-  const isPlayingRef = useRef(false);
   // Track active BufferSourceNodes so we can stop them on interrupt
   const activeSourceNodesRef = useRef([]);
   // Monotonic counter — increments on every interruption so stale audio is ignored
@@ -299,6 +298,13 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selec
 
   // --- AUDIO RECEIVE AND PLAYBACK ---
   const handleServerMessage = (msg) => {
+    // Mind map data from Gemini tool call — forward to App
+    if (msg.type === 'mind_map') {
+      console.log('[MindMap] Received mind map:', msg.data?.title);
+      onMindMapReceived?.(msg.data);
+      return;
+    }
+
     // If Gemini was interrupted by the user speaking, flush playback immediately
     if (msg.interrupted) {
       console.log('[Barge-in] Interrupted signal received — flushing audio buffer.');
@@ -314,8 +320,7 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selec
 
       // Clear the queue and reset the play cursor
       playbackQueueRef.current = [];
-      isPlayingRef.current = false;
-      nextPlayTimeRef.current = 0;  // CRITICAL: reset so next response plays immediately
+      nextPlayTimeRef.current = 0;  // reset so next response plays immediately
 
       // Keep the AudioContext alive — closing it would require a new one and cause
       // nextPlayTimeRef to be mismatched with the new context's clock
@@ -334,10 +339,52 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selec
     }
   };
 
+
+
+  // Keep track of exactly when the last chunk finishes so the next begins seamlessly
+  const nextPlayTimeRef = useRef(0);
+  const playCounterRef = useRef(0); // number of chunks currently scheduled/playing
+
+  // Drain the playback queue and schedule everything onto the Web Audio timeline.
+  // The browser handles gapless playback.
+  const scheduleQueue = () => {
+    const ctx = playbackContextRef.current;
+    if (!ctx) return;
+
+    // If nextPlayTime is in the past (start of session or post-interrupt), reset slightly ahead
+    if (nextPlayTimeRef.current < ctx.currentTime) {
+      nextPlayTimeRef.current = ctx.currentTime + 0.05;
+    }
+
+    while (playbackQueueRef.current.length > 0) {
+      const buffer = playbackQueueRef.current.shift();
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+
+      // Track so we can hard-stop on barge-in
+      activeSourceNodesRef.current.push(source);
+      playCounterRef.current += 1;
+
+      source.start(nextPlayTimeRef.current);
+      nextPlayTimeRef.current += buffer.duration;
+
+      source.onended = () => {
+        activeSourceNodesRef.current = activeSourceNodesRef.current.filter(n => n !== source);
+        playCounterRef.current -= 1;
+        
+        // If this was the absolute last chunk playing and there are no more chunks queued,
+        // trigger the onAudioFinished callback (used to auto-close the mind map).
+        if (playCounterRef.current === 0 && playbackQueueRef.current.length === 0) {
+          onAudioFinished?.();
+        }
+      };
+    }
+  };
+
   const playAudioChunk = (base64String) => {
     try {
       if (!playbackContextRef.current) {
-        // Gemini sends 24kHz audio via the Multimodal Live API
         playbackContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
           sampleRate: 24000
         });
@@ -352,76 +399,23 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selec
       }
 
       // 2. Convert raw PCM16 bytes to Float32 AudioBuffer
-      // Since it's 16-bit PCM, 2 bytes = 1 sample
       const int16Array = new Int16Array(bytes.buffer);
       const audioBuffer = playbackContextRef.current.createBuffer(
-        1,       // channels
-        int16Array.length, 
-        24000    // sample rate
+        1,
+        int16Array.length,
+        24000
       );
-
       const channelData = audioBuffer.getChannelData(0);
       for (let i = 0; i < int16Array.length; i++) {
         channelData[i] = int16Array[i] / 32768.0;
       }
 
-      // 3. Queue and Play contiguous
+      // 3. Push to queue and schedule immediately — no isPlayingRef needed
       playbackQueueRef.current.push(audioBuffer);
-      if (!isPlayingRef.current) {
-        playNextInQueue();
-      }
+      scheduleQueue();
 
     } catch (e) {
-      console.error("Audio playback decode error", e);
-    }
-  };
-
-  // Keep track of exactly when the last chunk finishes so the next begins seamlessly
-  const nextPlayTimeRef = useRef(0);
-
-  const playNextInQueue = () => {
-    if (playbackQueueRef.current.length === 0) {
-      isPlayingRef.current = false;
-      return;
-    }
-    
-    isPlayingRef.current = true;
-    const ctx = playbackContextRef.current;
-    if (!ctx) {
-      isPlayingRef.current = false;
-      return;
-    }
-    
-    // If we've lagged or nextPlayTime was reset (post-interrupt), start from now
-    if (nextPlayTimeRef.current < ctx.currentTime) {
-      nextPlayTimeRef.current = ctx.currentTime + 0.02; // 20ms buffer
-    }
-
-    const buffer = playbackQueueRef.current.shift();
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(ctx.destination);
-
-    // Track this node so we can hard-stop it on barge-in
-    activeSourceNodesRef.current.push(source);
-    
-    source.start(nextPlayTimeRef.current);
-    nextPlayTimeRef.current += buffer.duration;
-
-    source.onended = () => {
-      // Remove from the tracking list
-      activeSourceNodesRef.current = activeSourceNodesRef.current.filter(n => n !== source);
-
-      if (playbackQueueRef.current.length > 0 && ctx.currentTime >= nextPlayTimeRef.current - 0.1) {
-        playNextInQueue();
-      } else if (playbackQueueRef.current.length === 0) {
-        isPlayingRef.current = false;
-      }
-    };
-    
-    // Recursively schedule everything currently in queue immediately
-    if (playbackQueueRef.current.length > 0) {
-      playNextInQueue();
+      console.error('Audio playback decode error', e);
     }
   };
 
