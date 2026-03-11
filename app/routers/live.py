@@ -14,8 +14,10 @@ from services.embedding_service import embedding_service
 
 router = APIRouter(prefix="/live", tags=["live"])
 
-# Exact model name returned by client.models.list() that supports bidiGenerateContent
-LIVE_MODEL = "models/gemini-2.5-flash-native-audio-preview-12-2025"
+# Exact model name returned by client.models.list() that supports bidiGenerateContent with Multimodal Vision
+LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"
+
+active_clients = set()
 
 @router.get("/config")
 def get_live_config():
@@ -56,6 +58,7 @@ def search_concept(query: str) -> Dict[str, Any]:
 @router.websocket("/ws-realtime")
 async def live_agent_realtime_endpoint(websocket: WebSocket):
     await websocket.accept()
+    active_clients.add(websocket)
     logging.info("Client connected to Python Live Agent Proxy")
 
     client = genai.Client(http_options={'api_version': 'v1beta'})
@@ -106,6 +109,24 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
                         required=["title", "nodes"]
                     )
                 ),
+                types.FunctionDeclaration(
+                    name="generate_video",
+                    description=(
+                        "Create and stream a highly engaging animated educational video explaining ANY topic, "
+                        "such as Neural Networks, Physics, Math, or general stories (e.g., cats, kings, gravity). "
+                        "Call this when the user asks to 'generate a video', 'animate', or 'show an animation'."
+                    ),
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "prompt": types.Schema(
+                                type=types.Type.STRING,
+                                description="The topic, architecture, or prompt for the video generation."
+                            )
+                        },
+                        required=["prompt"]
+                    )
+                ),
             ]
         )],
         response_modalities=["AUDIO"],
@@ -134,7 +155,11 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
                 "- IMPORTANT: After the map appears, you MUST explain the structure of the map. "
                 "  Clearly explain what the nodes are and how they are related to each other conversationally. "
                 "  DO NOT use any Markdown formatting, bolding, or bullet points, as this is a spoken conversation. "
-                "- The root node should have id='root' and no parent field."
+                "- The root node should have id='root' and no parent field. "
+                "VIDEO NARRATION RULES: "
+                "- If a [SYSTEM MESSAGE] indicates a video is playing, IGNORE the 1-2 short sentence rule completely. "
+                "- You MUST provide a continuous, engaging, real-time voiceover narrating exactly what is happening visually frame-by-frame. "
+                "- Do NOT stop speaking until the video ends. Flow naturally and match your pacing to the changing visuals."
             )
         )])
     )
@@ -165,6 +190,8 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
                             chunks = msg["realtimeInput"]["mediaChunks"]
                             for chunk in chunks:
                                 mime_type = chunk["mimeType"]
+                                if 'image' in mime_type:
+                                    logging.info(f"Received image chunk: {mime_type}")
                                 raw_bytes = base64.b64decode(chunk["data"])
                                 await session.send(input={"mime_type": mime_type, "data": raw_bytes})
 
@@ -213,6 +240,53 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
                                             result = {
                                                 "status": "success",
                                                 "message": "Mind map has been rendered on the user's screen."
+                                            }
+
+                                        elif call.name == "generate_video":
+                                            prompt = call.args.get('prompt')
+                                            logging.info(f"generate_video called: prompt='{prompt}'")
+                                            await websocket.send_json({
+                                                "type": "video_status",
+                                                "status": "generating",
+                                                "prompt": prompt
+                                            })
+                                            
+                                            async def background_generate_video(p: str):
+                                                from services.video_service import run_manim_pipeline
+                                                logging.info(f"Starting background Manim pipeline for: {p}")
+                                                try:
+                                                    # Run fully-sync manim pipeline in a background thread to prevent blocking asyncio
+                                                    res = await asyncio.to_thread(run_manim_pipeline, p)
+                                                    if res.get("status") == "success":
+                                                        msg = {
+                                                            "type": "video_ready",
+                                                            "data": {
+                                                                "title": res['title'],
+                                                                "url": res['url']
+                                                            }
+                                                        }
+                                                    else:
+                                                        logging.error(f"Video generation failed: {res.get('message')}")
+                                                        msg = {
+                                                            "type": "video_error",
+                                                            "message": res.get("message")
+                                                        }
+                                                        
+                                                    # Broadcast result to all newly/currently active client connections
+                                                    for active_ws in list(active_clients):
+                                                        try:
+                                                            await active_ws.send_json(msg)
+                                                        except Exception as ws_err:
+                                                            logging.error(f"Failed to broadcast video_ready: {ws_err}")
+                                                except Exception as e:
+                                                    logging.error(f"Error in background_generate_video: {e}")
+
+                                            # Dispatch to background task immediately
+                                            asyncio.create_task(background_generate_video(prompt))
+
+                                            result = {
+                                                "status": "success",
+                                                "message": "Video generation has started silently in the background. Tell the user it is rendering and ask them to stand by for a few moments."
                                             }
 
                                         else:
@@ -269,6 +343,7 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
     except Exception as e:
         logging.error(f"WebSocket session ended: {e}")
     finally:
+        active_clients.discard(websocket)
         try:
             await websocket.close()
         except Exception:

@@ -7,6 +7,7 @@ import LiveAssistant from './components/LiveAssistant';
 import GestureController from './components/GestureController';
 import ProcessingOverlay from './components/ProcessingOverlay';
 import MindMapViewer from './components/MindMapViewer';
+import VideoViewer from './components/VideoViewer';
 import './index.css';
 
 // Mock data to ensure react-force-graph renders correctly
@@ -34,6 +35,8 @@ function App() {
   const [processingFile, setProcessingFile] = useState(null);
   const [mindMapData, setMindMapData] = useState(null);
   const [mindMapHistory, setMindMapHistory] = useState([]);
+  const [videoData, setVideoData] = useState(null);
+  const [videoHistory, setVideoHistory] = useState([]);
   
   const fgRef = useRef();
   const leftPanelRef = useRef();
@@ -181,6 +184,16 @@ function App() {
                onClose={() => setMindMapData(null)}
              />
            )}
+           {/* Video overlay — rendered on top of the 3D graph */}
+           {videoData && (
+             <VideoViewer
+               videoData={videoData}
+               onClose={() => {
+                 setVideoHistory(prev => [videoData, ...prev]);
+                 setVideoData(null);
+               }}
+             />
+           )}
         </div>
 
         <div className="right-panel">
@@ -250,6 +263,41 @@ function App() {
                  </div>
                </div>
              )}
+
+             {/* Video History */}
+             {videoHistory.length > 0 && (
+               <div className="video-history" style={{ 
+                 marginTop: '1rem', padding: '12px', background: 'rgba(255,255,255,0.03)', 
+                 borderRadius: '8px', border: '1px solid rgba(255,255,255,0.05)'
+               }}>
+                 <h4 style={{ margin: '0 0 10px 0', fontSize: '0.8rem', color: '#94a3b8', textTransform: 'uppercase', letterSpacing: '0.5px' }}>Video History</h4>
+                 <div style={{ display: 'flex', flexDirection: 'column', gap: '6px', maxHeight: '160px', overflowY: 'auto' }}>
+                   {videoHistory.map((video, idx) => (
+                     <button
+                       key={idx}
+                       onClick={() => setVideoData(video)}
+                       style={{
+                         background: 'transparent', border: '1px solid #475569',
+                         color: '#e2e8f0', padding: '8px 12px', borderRadius: '6px',
+                         textAlign: 'left', cursor: 'pointer', fontSize: '0.85rem',
+                         transition: 'all 0.2s', display: 'flex', alignItems: 'center', gap: '8px'
+                       }}
+                       onMouseEnter={e => {
+                         e.currentTarget.style.background = 'rgba(255,255,255,0.05)';
+                         e.currentTarget.style.borderColor = '#64748b';
+                       }}
+                       onMouseLeave={e => {
+                         e.currentTarget.style.background = 'transparent';
+                         e.currentTarget.style.borderColor = '#475569';
+                       }}
+                     >
+                       <span style={{ fontSize: '1rem', opacity: 0.8 }}>🎬</span>
+                       <span style={{ whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>{video.title}</span>
+                     </button>
+                   ))}
+                 </div>
+               </div>
+             )}
           </div>
 
           <div className="bottom-inputs">
@@ -260,6 +308,22 @@ function App() {
                onMindMapReceived={(data) => {
                  setMindMapData(data);
                  setMindMapHistory(prev => [data, ...prev]);
+               }}
+               onVideoStatus={(msg) => {
+                 if (msg.status === 'generating') {
+                   setIsProcessing(true);
+                   setProcessingFile(msg.prompt || 'Generating Video Module...');
+                 }
+               }}
+               onVideoReady={(data) => {
+                 setIsProcessing(false);
+                 setProcessingFile(null);
+                 setVideoData(data);
+               }}
+               onVideoError={(msg) => {
+                 setIsProcessing(false);
+                 setProcessingFile(null);
+                 console.error("Video Server Error:", msg);
                }}
                onAudioFinished={() => {
                   console.log("Audio finished! Auto-closing mind map in 1.5s...");

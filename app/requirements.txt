@@ -11,3 +11,4 @@ python-dotenv
 networkx
 sentence-transformers
 pdfminer.six
+manim

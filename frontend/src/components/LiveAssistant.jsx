@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import * as base64js from 'base64-js';
 
-const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, onMindMapReceived, onAudioFinished, selectedNode, graphData }) => {
+const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, onMindMapReceived, onVideoStatus, onVideoReady, onVideoError, onAudioFinished, selectedNode, graphData }) => {
   const [isConnected, setIsConnected] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [error, setError] = useState(null);
@@ -74,6 +74,14 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, onMin
         if (wsRef.current !== ws) return;
         setIsConnected(true);
         onStateChange?.('connected');
+        
+        // If we reconnected during an active session, automatically resume capture
+        if (hasStartedRef.current) {
+          console.log("Reconnected successfully. Resuming capture...");
+          setTimeout(() => {
+            startRecording();
+          }, 100);
+        }
       };
 
       ws.onclose = () => {
@@ -83,14 +91,17 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, onMin
         cleanupAudio();
         onStateChange?.('disconnected');
         
+        // Nullify reference so the timeout knows it's safe to spawn a new socket
+        wsRef.current = null;
+        
         // Auto-reconnect to maintain "Always On" state if we didn't deliberately disconnect
         if (hasStartedRef.current) {
-          console.log("WebSocket closed unexpectedly. Reconnecting in 1 second...");
+          console.log("WebSocket closed unexpectedly. Reconnecting in 5 seconds...");
           setTimeout(() => {
             if (hasStartedRef.current && !wsRef.current) {
               connect();
             }
-          }, 1000);
+          }, 5000);
         }
       };
 
@@ -134,7 +145,8 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, onMin
 
   // --- AUDIO CAPTURE AND SEND ---
   const startRecording = async () => {
-    if (!isConnected) return;
+    // We check wsRef instead of isConnected state because state updates are async
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
     try {
       // Create a 16kHz audio context as required by Gemini
       audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
@@ -169,6 +181,7 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, onMin
         if (speakingNow && !isSpeakingRef.current) {
           // User just started speaking — attach a single graph snapshot
           isSpeakingRef.current = true;
+          console.log('[VAD] Speech Detected, sending graph context snapshot.');
           const canvas = graphContainerRef?.current?.querySelector('canvas');
           if (canvas && wsRef.current?.readyState === WebSocket.OPEN) {
             const dataUrl = canvas.toDataURL('image/jpeg', 0.5);
@@ -186,11 +199,13 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, onMin
         const uint8 = new Uint8Array(int16PcmBuffer);
         const base64Data = base64js.fromByteArray(uint8);
 
+        // Always stream the audio to Gemini; Gemini's internal server-side VAD
+        // is far superior for handling barge-in and conversational tone.
         if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
           wsRef.current.send(JSON.stringify({
             realtimeInput: {
               mediaChunks: [{
-                mimeType: "audio/pcm",
+                mimeType: "audio/pcm;rate=16000",
                 data: base64Data
               }]
             }
@@ -292,9 +307,39 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, onMin
     return () => clearTimeout(timer); // Cancel if user moves to another node quickly
   }, [selectedNode, isRecording, graphData]);
 
-  // --- SCREEN (CANVAS) CAPTURE ---
-  // Images are now sent event-driven (on node change + on speech onset via VAD)
-  // instead of on a continuous interval. This avoids flooding the Gemini session.
+  // --- SCREEN (CANVAS) & VIDEO CAPTURE ---
+  // Graph Images are sent event-driven (on node change + on speech onset via VAD) to avoid flooding.
+  // Video Images are sent continuously at 1fps while a video is playing.
+  useEffect(() => {
+    if (!isConnected || !isRecording) return;
+    
+    const interval = setInterval(() => {
+      const videoEl = document.getElementById('active-video-player');
+      if (videoEl && !videoEl.paused && !videoEl.ended) {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          try {
+            // Draw current video frame to an offscreen canvas
+            const canvas = document.createElement('canvas');
+            canvas.width = videoEl.videoWidth || 640;
+            canvas.height = videoEl.videoHeight || 360;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+            
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.5);
+            const imgBase64 = dataUrl.split(',')[1];
+            
+            wsRef.current.send(JSON.stringify({
+              realtimeInput: { mediaChunks: [{ mimeType: 'image/jpeg', data: imgBase64 }] }
+            }));
+          } catch (e) {
+            console.error("Failed to capture video frame:", e);
+          }
+        }
+      }
+    }, 1000); // 1fps capture rate for Live Video
+    
+    return () => clearInterval(interval);
+  }, [isConnected, isRecording]);
 
   // --- AUDIO RECEIVE AND PLAYBACK ---
   const handleServerMessage = (msg) => {
@@ -302,6 +347,32 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, onMin
     if (msg.type === 'mind_map') {
       console.log('[MindMap] Received mind map:', msg.data?.title);
       onMindMapReceived?.(msg.data);
+      return;
+    }
+
+    if (msg.type === 'video_status') {
+      console.log('[Video] Status:', msg.status);
+      onVideoStatus?.(msg);
+      return;
+    }
+    
+    if (msg.type === 'video_ready') {
+      console.log('[Video] Ready:', msg.data?.title);
+      onVideoReady?.(msg.data);
+      
+      // Auto-prompt Gemini to begin narrating the video it is about to see
+      if (wsRef.current?.readyState === WebSocket.OPEN) {
+        const sysMsg = `[SYSTEM MESSAGE] A video titled "${msg.data?.title || 'Animation'}" is now playing on the user's screen. Watch the video frames closely and provide a CONTINUOUS, real-time, engaging voiceover narrating exactly what is happening visually frame-by-frame. IGNORE your 1-2 sentence constraint completely. You MUST speak continuously for the full duration of the video. Flow naturally with the visual changes.`;
+        wsRef.current.send(JSON.stringify({
+          clientContent: { turns: [{ role: 'user', parts: [{ text: sysMsg }] }], turnComplete: true }
+        }));
+      }
+      return;
+    }
+    
+    if (msg.type === 'video_error') {
+      console.error('[Video] Error:', msg.message);
+      onVideoError?.(msg.message);
       return;
     }
 
@@ -321,6 +392,7 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, onMin
       // Clear the queue and reset the play cursor
       playbackQueueRef.current = [];
       nextPlayTimeRef.current = 0;  // reset so next response plays immediately
+      playCounterRef.current = 0;   // fix: ensure we don't block subsequent auto-closing 
 
       // Keep the AudioContext alive — closing it would require a new one and cause
       // nextPlayTimeRef to be mismatched with the new context's clock
