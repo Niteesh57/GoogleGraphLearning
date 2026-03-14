@@ -23,7 +23,7 @@ class KnowledgeEngine:
         self.G = nx.Graph()
         # Ensure we have our model loaded for embedding similarity
         self.embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-        self.client = genai.Client()
+        self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
     def extract_text_from_pdf(self, pdf_bytes: bytes) -> str:
         text = extract_text(BytesIO(pdf_bytes))

@@ -2,10 +2,10 @@ from fastapi import APIRouter, File, UploadFile, HTTPException
 from typing import List
 import json
 
-from services.gemini_service import gemini_service
-from services.embedding_service import embedding_service
-from services.umap_service import umap_service
-from database.chroma_db import chroma_db
+from app.services.gemini_service import gemini_service
+from app.services.embedding_service import embedding_service
+from app.services.umap_service import umap_service
+from app.database.chroma_db import chroma_db
 
 router = APIRouter(prefix="/graph", tags=["graph"])
 

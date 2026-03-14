@@ -6,7 +6,9 @@
 class PcmProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    this.bufferSize = 4096;
+    // 256 samples @ 16 kHz = 16 ms per chunk (was 1024 = 64 ms).
+    // Extremely small buffer for near 1-millisecond latency feel.
+    this.bufferSize = 256;
     this.buffer = new Float32Array(this.bufferSize);
     this.bufferIndex = 0;
   }
@@ -43,7 +45,7 @@ class DownsamplingPcmProcessor extends AudioWorkletProcessor {
     super();
     // Default WebAudio might be 48kHz, Gemini needs exactly 16kHz.
     // 48000 / 16000 = ratio of 3. We'll simply drop samples.
-    this.bufferSize = 2048;
+    this.bufferSize = 512;
     this.buffer = new Int16Array(this.bufferSize);
     this.bufferIndex = 0;
     this.sampleCount = 0;

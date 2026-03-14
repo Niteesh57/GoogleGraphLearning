@@ -9,7 +9,7 @@ export default function TextConceptInput({ onConceptsExtracted }) {
 
     setLoading(true);
     try {
-      const res = await fetch("http://localhost:8000/api/text-concepts", {
+      const res = await fetch(`${import.meta.env.VITE_API_URL}/api/text-concepts`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ text }),

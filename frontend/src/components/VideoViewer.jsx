@@ -1,7 +1,8 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useState, useRef } from 'react';
 
-export default function VideoViewer({ videoData, onClose }) {
+export default function VideoViewer({ videoData, onClose, onVideoPlay, onVideoPause }) {
   const [visible, setVisible] = useState(false);
+  const videoRef = useRef(null);
 
   useEffect(() => {
     // Delay slightly to trigger CSS transition
@@ -11,6 +12,8 @@ export default function VideoViewer({ videoData, onClose }) {
 
   const handleClose = () => {
     setVisible(false);
+    // Signal pause before closing so narration stops
+    onVideoPause?.();
     setTimeout(onClose, 250); // wait for fade out
   };
 
@@ -61,13 +64,19 @@ export default function VideoViewer({ videoData, onClose }) {
       {/* Video Content */}
       <div style={{ flex: 1, background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
         <video 
+          ref={videoRef}
           id="active-video-player"
           src={videoData.url} 
           autoPlay 
           controls 
           playsInline
           crossOrigin="anonymous"
-          onEnded={handleClose}
+          onPlay={() => onVideoPlay?.(videoData.title)}
+          onPause={() => onVideoPause?.()}
+          onEnded={() => {
+            onVideoPause?.();
+            handleClose();
+          }}
           style={{ width: '100%', height: '100%', objectFit: 'contain' }}
         />
       </div>

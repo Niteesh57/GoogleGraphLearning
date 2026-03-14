@@ -343,3 +343,209 @@ button:disabled {
   background: var(--primary); 
   transform: scale(1.2);
 }
+
+/* ===================================================================
+   VIEW MODE TOOLBAR
+   =================================================================== */
+.view-mode-bar {
+  display: flex;
+  gap: 0.4rem;
+  align-items: center;
+  margin-left: auto;
+}
+
+.view-mode-btn {
+  background: transparent;
+  color: var(--text-muted);
+  border: 1px solid var(--border);
+  padding: 0.35rem 0.75rem;
+  font-size: 0.8rem;
+  border-radius: 0.375rem;
+  cursor: pointer;
+  transition: all 0.15s;
+}
+
+.view-mode-btn:hover { background: #f1f5f9; color: var(--text-main); }
+.view-mode-btn.active {
+  background: var(--primary);
+  color: white;
+  border-color: var(--primary);
+}
+
+/* ===================================================================
+   VR SPLIT-SCREEN
+   =================================================================== */
+.vr-root {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  background: #000;
+  z-index: 9000;
+}
+
+.vr-eye {
+  flex: 1;
+  position: relative;
+  overflow: hidden;
+}
+
+.vr-divider {
+  width: 4px;
+  background: #111;
+  flex-shrink: 0;
+}
+
+.vr-camera-overlay {
+  position: absolute;
+  bottom: 1rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 10;
+  width: 160px;
+  height: 120px;
+  border-radius: 8px;
+  overflow: hidden;
+  border: 2px solid rgba(255,255,255,0.3);
+}
+
+.camera-pip {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: #000;
+}
+
+.app-layout[data-view="mobile"] .left-panel {
+  position: relative;
+  z-index: 5;
+}
+
+.app-layout[data-view="mobile"] .graph-view-container {
+  background: transparent !important;
+}
+
+.app-layout[data-view="mobile"] .camera-pip {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+}
+
+.vr-exit-btn {
+  position: fixed;
+  top: 1rem;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 9100;
+  background: rgba(0,0,0,0.6);
+  color: white;
+  border: 1px solid rgba(255,255,255,0.3);
+  padding: 0.4rem 1rem;
+  border-radius: 9999px;
+  font-size: 0.8rem;
+  cursor: pointer;
+}
+
+/* ===================================================================
+   CAMERA CAPTURE
+   =================================================================== */
+.camera-capture {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  width: 100%;
+  height: 100%;
+  background: #000;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.camera-preview {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.camera-toggle-btn {
+  position: absolute;
+  bottom: 0.5rem;
+  right: 0.5rem;
+  background: rgba(0,0,0,0.55);
+  color: white;
+  border: 1px solid rgba(255,255,255,0.3);
+  border-radius: 9999px;
+  font-size: 0.75rem;
+  padding: 0.3rem 0.7rem;
+  cursor: pointer;
+  backdrop-filter: blur(4px);
+}
+
+.camera-error {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: #ef4444;
+  font-size: 0.85rem;
+  padding: 1rem;
+  text-align: center;
+}
+
+/* Camera pip (picture-in-picture) in normal mode */
+.camera-pip {
+  position: absolute;
+  bottom: 1.5rem;
+  right: 1.5rem;
+  width: 180px;
+  height: 135px;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 2px solid rgba(99,102,241,0.6);
+  box-shadow: 0 4px 20px rgba(0,0,0,0.3);
+  z-index: 50;
+}
+
+/* ===================================================================
+   MOBILE RESPONSIVE
+   =================================================================== */
+@media (max-width: 768px) {
+  .app-header {
+    padding: 0.75rem 1rem;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+  }
+
+  .app-header h1 { font-size: 1rem; }
+
+  .main-content {
+    flex-direction: column;
+    overflow-y: auto;
+  }
+
+  .left-panel {
+    flex: none;
+    height: 55vw;           /* compact graph on mobile */
+    min-height: 240px;
+    border-right: none;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .right-panel {
+    min-width: unset;
+    max-width: unset;
+    flex: 1;
+    padding: 1rem;
+    gap: 1rem;
+  }
+
+  button { padding: 0.6rem 1rem; font-size: 0.9rem; }
+
+  .view-mode-bar { margin-left: 0; margin-top: 0.5rem; }
+
+  /* In mobile mode, show camera pip in left panel */
+  .camera-pip {
+    width: 120px;
+    height: 90px;
+    bottom: 0.5rem;
+    right: 0.5rem;
+  }
+}

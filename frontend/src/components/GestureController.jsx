@@ -2,10 +2,21 @@ import { useEffect, useRef, useState } from 'react';
 
 const smooth = (prev, next) => prev * 0.7 + next * 0.3;
 
-export default function GestureController({ onSwipe }) {
+export default function GestureController({ onSwipe, isActive: propActive, onActiveChange }) {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
-  const [isActive, setIsActive] = useState(false);
+  
+  // Use local state if no prop is provided, otherwise sync with prop
+  const [internalActive, setInternalActive] = useState(false);
+  const isActive = propActive !== undefined ? propActive : internalActive;
+
+  const toggleActive = () => {
+    if (onActiveChange) {
+      onActiveChange(!isActive);
+    } else {
+      setInternalActive(!isActive);
+    }
+  };
 
   // Keep latest values accessible inside the MediaPipe loop without restarting it
   const onSwipeRef = useRef(onSwipe);
@@ -55,9 +66,8 @@ export default function GestureController({ onSwipe }) {
       window.drawConnectors(ctx, hand, window.HAND_CONNECTIONS, { color: '#00FF00', lineWidth: 1.5 });
       window.drawLandmarks(ctx, hand, { color: '#FF0000', lineWidth: 1, radius: 1.5 });
 
-      // Index fingertip (8) = cursor; Thumb (4) = pinch partner
+      // Index fingertip (8) = cursor
       const index = hand[8];
-      const thumb = hand[4];
 
       // Mirror X so moving right feels like moving right
       const rawX = (1 - index.x) * canvas.width;
@@ -77,36 +87,28 @@ export default function GestureController({ onSwipe }) {
       ctx.stroke();
       ctx.restore();
 
-      // ── GRAPH PANNING REMOVED ──────────────────────────────────────────────
-      // ── PINCH ZOOM REMOVED ──────────────────────────────────────────
-
       // ── NODE FOCUS: DIRECTIONAL SWIPE NAVIGATION ───────────────────────────
       if (state.current.prevCursorX !== null) {
         const dx = cx - state.current.prevCursorX;
         const dy = cy - state.current.prevCursorY;
 
         // Require a firm swipe gesture to trigger navigation
-        if (Math.abs(dx) > 15 || Math.abs(dy) > 15) { // tuned swipe threshold
-          // Calculate angle of swipe
+        if (Math.abs(dx) > 15 || Math.abs(dy) > 15) { 
           const swipeAngle = Math.atan2(dy, dx);
           let direction = "NONE";
 
-          // pi/4 = 45 degrees. Classify into 4 quadrants
           if (swipeAngle > -Math.PI / 4 && swipeAngle <= Math.PI / 4) direction = "RIGHT";
           else if (swipeAngle > Math.PI / 4 && swipeAngle <= 3 * Math.PI / 4) direction = "DOWN";
           else if (swipeAngle < -Math.PI / 4 && swipeAngle >= -3 * Math.PI / 4) direction = "UP";
           else direction = "LEFT";
 
-          // Call the central navigation function in App.jsx
           onSwipeRef.current?.(direction);
           
-          // "Consume" the swipe by resetting the tracking coordinates so it doesn't trigger repeatedly
           state.current.prevCursorX = cx;
           state.current.prevCursorY = cy;
         }
       }
 
-      // Only update previous position if we didn't just consume a swipe
       if (Math.abs(cx - (state.current.prevCursorX||cx)) < 15 && Math.abs(cy - (state.current.prevCursorY||cy)) < 15) {
         state.current.prevCursorX = cx;
         state.current.prevCursorY = cy;
@@ -131,7 +133,7 @@ export default function GestureController({ onSwipe }) {
       camera.stop();
       try { hands.close(); } catch (e) { }
     };
-  }, [isActive]); // fgRef, graphData, onNodeFocus never go in here — handled via refs above
+  }, [isActive]); 
 
   return (
     <div className="input-panel-card gesture-card">
@@ -139,7 +141,7 @@ export default function GestureController({ onSwipe }) {
       <div className="gesture-controls">
         <button
           className={`mic-button ${isActive ? 'active' : ''}`}
-          onClick={() => setIsActive(a => !a)}
+          onClick={toggleActive}
           style={{ marginBottom: '0.5rem' }}
         >
           {isActive ? '✋ Stop Gesture Mode' : '🖐 Start Gesture Mode'}

@@ -9,15 +9,42 @@ import base64
 from google import genai
 from google.genai import types
 
-from database.chroma_db import chroma_db
-from services.embedding_service import embedding_service
+from app.database.chroma_db import chroma_db
+from app.services.embedding_service import embedding_service
 
 router = APIRouter(prefix="/live", tags=["live"])
 
 # Exact model name returned by client.models.list() that supports bidiGenerateContent with Multimodal Vision
-LIVE_MODEL = "gemini-2.5-flash-native-audio-latest"
+LIVE_MODEL = "gemini-2.5-flash-native-audio-preview-12-2025"
 
 active_clients = set()
+
+# ── SERVER-SIDE SESSION STORE ──────────────────────────────────────────────────
+SESSION_STORE: Dict[str, Dict] = {}          # sessionId -> session context
+ACTIVE_SESSION_SOCKETS: Dict[str, Any] = {}  # sessionId -> live WebSocket
+
+def get_or_create_session(session_id: str) -> Dict:
+    if session_id not in SESSION_STORE:
+        SESSION_STORE[session_id] = {
+            "videos_generated": [],
+            "mind_maps_created": [],
+            "last_topic": None,
+        }
+    return SESSION_STORE[session_id]
+
+def build_resumption_context(session: Dict) -> str:
+    """Build a brief context message to orient Gemini on reconnect."""
+    lines = ["[SESSION RESUME] You are reconnecting to an ongoing tutoring session."]
+    if session.get("last_topic"):
+        lines.append(f"The user was last discussing: {session['last_topic']}.")
+    if session.get("mind_maps_created"):
+        recent_maps = [m["title"] for m in session["mind_maps_created"][-3:]]
+        lines.append(f"Mind maps created in this session: {', '.join(recent_maps)}.")
+    if session.get("videos_generated"):
+        recent_vids = [v["title"] for v in session["videos_generated"][-3:]]
+        lines.append(f"Videos generated in this session: {', '.join(recent_vids)}.")
+    lines.append("Greet the user very briefly (one sentence max) and wait.")
+    return " ".join(lines)
 
 @router.get("/config")
 def get_live_config():
@@ -58,10 +85,17 @@ def search_concept(query: str) -> Dict[str, Any]:
 @router.websocket("/ws-realtime")
 async def live_agent_realtime_endpoint(websocket: WebSocket):
     await websocket.accept()
+    
+    # Lock to prevent interleaving audio frames and tool responses
+    send_lock = asyncio.Lock()
+    
     active_clients.add(websocket)
     logging.info("Client connected to Python Live Agent Proxy")
 
-    client = genai.Client(http_options={'api_version': 'v1beta'})
+    client = genai.Client(
+        api_key=os.getenv("GEMINI_API_KEY"),
+        http_options={'api_version': 'v1beta'}
+    )
 
     config = types.LiveConnectConfig(
         tools=[types.Tool(
@@ -90,6 +124,16 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
                             "title": types.Schema(
                                 type=types.Type.STRING,
                                 description="The central topic of the mind map."
+                            ),
+                            "mode": types.Schema(
+                                type=types.Type.STRING,
+                                description=(
+                                    "Whether to create a brand-new map ('new') or merge nodes "
+                                    "into the existing map ('append'). "
+                                    "Use 'append' when the user says things like 'add this to the current map', "
+                                    "'this is page 2 of the same chapter', 'add this to my existing graph', etc. "
+                                    "Use 'new' for completely new topics."
+                                )
                             ),
                             "nodes": types.Schema(
                                 type=types.Type.ARRAY,
@@ -130,36 +174,36 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
             ]
         )],
         response_modalities=["AUDIO"],
-        media_resolution="MEDIA_RESOLUTION_MEDIUM",
+        media_resolution="MEDIA_RESOLUTION_LOW",
         context_window_compression=types.ContextWindowCompressionConfig(
             trigger_tokens=104857,
             sliding_window=types.SlidingWindow(target_tokens=52428),
+        ),
+        generation_config=types.GenerationConfig(
+            temperature=0.1,
+            top_k=2
         ),
         system_instruction=types.Content(parts=[types.Part.from_text(
             text=(
                 "You are a conversational AI tutor embedded in a live Knowledge Graph explorer. "
                 "The user's screen (graph images) and microphone audio are streamed to you in real time. "
+                "You may also receive images from the user's camera (e.g. pages of a book) — treat these as visual context for learning. "
+                "CORE CAPABILITY: Interactive Camera Mapping. "
+                "- If the user says 'capture this and generate a map', 'read this page and make a map', etc., "
+                "  look at the most recent camera image provided. "
+                "  Analyze the text or concepts on that page/image and call `create_mind_map`. "
+                "- Decision Logic: If the user says 'add this to the current map', use mode='append'. "
+                "  If they say 'make a new map', use mode='new'. If ambiguous, ask or default to 'new'. "
                 "RULES FOR INTERACTION: "
                 "- ALWAYS keep each response to 1-2 short sentences. Never deliver a long lecture. "
-                "- Start with a single key insight, then STOP and WAIT for the user to react or ask a follow-up. "
-                "- If the user navigates to a new node (you will receive a [GRAPH CONTEXT] message), "
-                "  just announce it: 'You moved to [node]. It connects to [neighbor1] and [neighbor2].' Then stop. "
-                "- If the user asks a question, answer it directly in 1-2 sentences and stop. "
-                "- If the user says 'wait', 'hold on', 'stop', or interrupts — stop speaking immediately. "
-                "- Be natural and conversational, like a tutor sitting beside the user. "
+                "- If the user navigates a node, announce it simply. "
+                "- If they ask a question about the book/camera view, answer directly. "
                 "MIND MAP RULES: "
-                "- If the user asks to create, make, show, or visualize a mind map about any topic, "
-                "  first say 'Let me build that for you...' and briefly speak your reasoning about "
-                "  the structure out loud as you think of it. Then call the create_mind_map tool "
-                "  with 6-12 well-described nodes. "
-                "- IMPORTANT: After the map appears, you MUST explain the structure of the map. "
-                "  Clearly explain what the nodes are and how they are related to each other conversationally. "
-                "  DO NOT use any Markdown formatting, bolding, or bullet points, as this is a spoken conversation. "
-                "- The root node should have id='root' and no parent field. "
+                "- Before calling the tool, say 'Let me read that for you...' or 'Mapping those concepts now...' "
+                "- Explain the map structure after it appears. Conversationally describe the links. "
+                "- Root node id must be 'root'. "
                 "VIDEO NARRATION RULES: "
-                "- If a [SYSTEM MESSAGE] indicates a video is playing, IGNORE the 1-2 short sentence rule completely. "
-                "- You MUST provide a continuous, engaging, real-time voiceover narrating exactly what is happening visually frame-by-frame. "
-                "- Do NOT stop speaking until the video ends. Flow naturally and match your pacing to the changing visuals."
+                "- During video playback, provide a continuous frame-by-frame narration. Ignore the short response rule."
             )
         )])
     )
@@ -175,7 +219,8 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
             # After the tool_response is sent, we set() it again to resume audio.
             tool_gate = asyncio.Event()
             tool_gate.set()  # Open by default — audio flows freely
-            # ──────────────────────────────────────────────────────────────────────
+            # ──────────────────────────────────────────────────
+            current_session: Dict[str, Any] = {"id": None}  # mutable session state for this connection
 
             async def receive_from_client():
                 """Forward frontend audio/images to Gemini, gated by tool_gate."""
@@ -184,25 +229,55 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
                         data = await websocket.receive_text()
                         msg = json.loads(data)
 
+                        # ── Session init: client sends its sessionId on connect
+                        if msg.get("type") == "init":
+                            session_id = msg.get("sessionId", "")
+                            if session_id:
+                                current_session["id"] = session_id
+                                ACTIVE_SESSION_SOCKETS[session_id] = websocket
+                                session_data = get_or_create_session(session_id)
+                                logging.info(f"Session INIT: sessionId={session_id}, known={bool(session_data.get('last_topic'))}")
+                                # If we have a prior context, send a brief resumption message to Gemini
+                                if session_data.get("last_topic") or session_data.get("nodes_visited"):
+                                    resumption_ctx = build_resumption_context(session_data)
+                                    await session.send_client_content(
+                                        turns=[types.Content(role="user", parts=[types.Part.from_text(text=resumption_ctx)])],
+                                        turn_complete=True
+                                    )
+                            continue
+
+                        # (Node history tracking has been removed by user request)
+
                         if "realtimeInput" in msg:
-                            # Wait until any in-flight tool call has been resolved
-                            await tool_gate.wait()
-                            chunks = msg["realtimeInput"]["mediaChunks"]
-                            for chunk in chunks:
+                            # ── CRITICAL: Do NOT block the receive loop waiting for a tool call.
+                            # Instead: simply discard audio that arrives while a tool call is running.
+                            
+                            media_chunks = []
+                            for chunk in msg["realtimeInput"]["mediaChunks"]:
                                 mime_type = chunk["mimeType"]
-                                if 'image' in mime_type:
-                                    logging.info(f"Received image chunk: {mime_type}")
-                                raw_bytes = base64.b64decode(chunk["data"])
-                                await session.send(input={"mime_type": mime_type, "data": raw_bytes})
+                                raw_base64 = chunk["data"]
+                                padding_needed = len(raw_base64) % 4
+                                if padding_needed:
+                                    raw_base64 += "=" * (4 - padding_needed)
+                                raw_bytes = base64.b64decode(raw_base64)
+                                media_chunks.append({"mime_type": mime_type, "data": raw_bytes})
+                            
+                            if media_chunks:
+                                # Hop straight to session send without lock or gate.
+                                await session.send(input={"media_chunks": media_chunks})
 
                         if "clientContent" in msg:
                             # Text context messages (e.g. node description) are always safe
-                            await session.send(
-                                input=types.LiveClientContent(**msg["clientContent"])
-                            )
-
+                            async with send_lock:
+                                await session.send(
+                                    input=types.LiveClientContent(**msg["clientContent"])
+                                )
                 except WebSocketDisconnect:
                     logging.info("Frontend WebSocket disconnected normally.")
+                    # Remove from active session map
+                    sid = current_session.get("id")
+                    if sid and ACTIVE_SESSION_SOCKETS.get(sid) is websocket:
+                        del ACTIVE_SESSION_SOCKETS[sid]
                 except Exception as e:
                     import traceback
                     logging.error(f"Error in receive_from_client: {e}\n{traceback.format_exc()}")
@@ -219,10 +294,9 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
                                 logging.info("Gemini interrupted — signalling frontend to flush.")
                                 await websocket.send_json({"interrupted": True})
 
-                            # 2. Handle Tool Calls — CLOSE the gate while tool is pending
+                            # 2. Handle Tool Calls
                             if chunk.tool_call:
-                                tool_gate.clear()  # Stop audio forwarding immediately
-                                logging.info(f"Tool call received — gate CLOSED. Tools: {[c.name for c in chunk.tool_call.function_calls]}")
+                                logging.info(f"Tool call received. Tools: {[c.name for c in chunk.tool_call.function_calls]}")
                                 try:
                                     responses = []
                                     for call in chunk.tool_call.function_calls:
@@ -236,6 +310,15 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
                                                 "type": "mind_map",
                                                 "data": dict(call.args)
                                             })
+                                            # Save to session store so it remembers on reconnect
+                                            title = call.args.get('title')
+                                            if title:
+                                                sid = current_session.get("id")
+                                                if sid:
+                                                    sess = get_or_create_session(sid)
+                                                    sess["mind_maps_created"].append({"title": title})
+                                                    sess["last_topic"] = title
+                                                    
                                             # ACK Gemini instantly so it can resume speaking
                                             result = {
                                                 "status": "success",
@@ -252,17 +335,24 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
                                             })
                                             
                                             async def background_generate_video(p: str):
-                                                from services.video_service import run_manim_pipeline
+                                                from app.services.video_service import run_manim_pipeline
                                                 logging.info(f"Starting background Manim pipeline for: {p}")
                                                 try:
                                                     # Run fully-sync manim pipeline in a background thread to prevent blocking asyncio
                                                     res = await asyncio.to_thread(run_manim_pipeline, p)
                                                     if res.get("status") == "success":
+                                                        # Save to session store
+                                                        sid = current_session.get("id")
+                                                        if sid:
+                                                            sess = get_or_create_session(sid)
+                                                            sess["videos_generated"].append({"title": res["title"]})
+                                                            sess["last_topic"] = res["title"]
                                                         msg = {
                                                             "type": "video_ready",
                                                             "data": {
                                                                 "title": res['title'],
-                                                                "url": res['url']
+                                                                "url": res['url'],
+                                                                "solution_steps": res.get('solution_steps', '')
                                                             }
                                                         }
                                                     else:
@@ -298,14 +388,10 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
                                             response=result
                                         ))
                                     # Send all tool responses in one batch
-                                    await session.send(
-                                        input=types.LiveClientToolResponse(function_responses=responses)
-                                    )
-                                    logging.info("Tool responses sent — gate OPEN.")
-                                finally:
-                                    tool_gate.set()  # Re-open gate whether or not tool succeeded
-
-                            # 3 & 4. Extract Audio and Text from model_turn.parts (SDK v1+)
+                                    await session.send_tool_response(function_responses=responses)
+                                    logging.info("Tool responses sent.")
+                                except Exception as e:
+                                    logging.error(f"Error handling tool call: {e}")
                             #  chunk.data and chunk.text are NOT set on the root — they live inside
                             #  server_content.model_turn.parts as inline_data / text parts.
                             if chunk.server_content and chunk.server_content.model_turn:

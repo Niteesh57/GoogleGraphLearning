@@ -8,6 +8,9 @@ import GestureController from './components/GestureController';
 import ProcessingOverlay from './components/ProcessingOverlay';
 import MindMapViewer from './components/MindMapViewer';
 import VideoViewer from './components/VideoViewer';
+import CameraCapture from './components/CameraCapture';
+import VRMode from './components/VRMode';
+import PermissionsModal from './components/PermissionsModal';
 import './index.css';
 
 // Mock data to ensure react-force-graph renders correctly
@@ -37,10 +40,18 @@ function App() {
   const [mindMapHistory, setMindMapHistory] = useState([]);
   const [videoData, setVideoData] = useState(null);
   const [videoHistory, setVideoHistory] = useState([]);
-  
+  // viewMode: 'desktop' | 'mobile' | 'vr'
+  const [viewMode, setViewMode] = useState('desktop');
+  const [cameraActive, setCameraActive] = useState(false);
+  const [showPermissionsModal, setShowPermissionsModal] = useState(false);
+  const [hasGrantedPermissions, setHasGrantedPermissions] = useState(false);
+  const [isGestureActive, setIsGestureActive] = useState(false);
+
   const fgRef = useRef();
   const leftPanelRef = useRef();
   const geminiTextEndRef = useRef(null);
+  const liveAssistantRef = useRef(null);
+  const cameraRef = useRef(null);   // ref into CameraCapture for frame grab
   const [graphSize, setGraphSize] = useState({ width: 700, height: 500 });
 
   // Auto-scroll Gemini explanation when new text arrives
@@ -60,6 +71,28 @@ function App() {
     ro.observe(leftPanelRef.current);
     return () => ro.disconnect();
   }, []);
+
+  // Enable camera when switching to mobile/vr
+  useEffect(() => {
+    const isMobileOrVR = viewMode === 'mobile' || viewMode === 'vr';
+    setCameraActive(isMobileOrVR && hasGrantedPermissions);
+    
+    if (isMobileOrVR && !hasGrantedPermissions) {
+      setShowPermissionsModal(true);
+    }
+
+    // Mobile/VR mode refinements:
+    if (isMobileOrVR) {
+      // 1. Start with an empty graph for a fresh interactive experience
+      setGraphData({ nodes: [], links: [] });
+      setSelectedNode(null);
+
+      // 2. Enable gestures by default in Mobile mode (for hand-free navigation)
+      if (viewMode === 'mobile') {
+        setIsGestureActive(true);
+      }
+    }
+  }, [viewMode, hasGrantedPermissions]);
 
   const handleNodeSelect = useCallback(node => {
      setSelectedNode(node);
@@ -139,11 +172,10 @@ function App() {
   }, [navigateDirection]);
 
   const refreshGraph = useCallback(() => {
-    fetch('http://localhost:8000/api/graph-state')
+    fetch(`${import.meta.env.VITE_API_URL}/api/graph-state`)
       .then(res => res.json())
       .then(data => {
         setGraphData(data);
-        // On initial data load, auto-select the first node to give the user a starting anchor
         if (data && data.nodes && data.nodes.length > 0 && !selectedNode) {
           handleNodeSelect(data.nodes[0]);
         }
@@ -151,11 +183,58 @@ function App() {
       .catch(err => console.error("Could not fetch graph data", err));
   }, [selectedNode, handleNodeSelect]);
 
+  // Mind map: Gemini tells us whether to append or replace
+  const handleMindMapReceived = useCallback((data) => {
+    if (data.mode === 'append') {
+      // Merge nodes/links into the existing force-graph (dedup by id)
+      setGraphData(prev => {
+        const existingIds = new Set(prev.nodes.map(n => n.id));
+        const newNodes = (data.nodes || []).filter(n => !existingIds.has(n.id));
+        const existingLinkKeys = new Set(
+          prev.links.map(l => {
+            const s = typeof l.source === 'object' ? l.source.id : l.source;
+            const t = typeof l.target === 'object' ? l.target.id : l.target;
+            return `${s}->${t}`;
+          })
+        );
+        const newLinks = (data.links || []).filter(l => {
+          return !existingLinkKeys.has(`${l.source}->${l.target}`);
+        });
+        return { nodes: [...prev.nodes, ...newNodes], links: [...prev.links, ...newLinks] };
+      });
+    } else {
+      setMindMapData(data);
+    }
+    setMindMapHistory(prev => [data, ...prev]);
+  }, []);
 
   return (
-    <div className="app-layout">
-      
-      {/* Processing overlay — shown during PDF upload */}
+    <div className="app-layout" data-view={viewMode}>
+
+      <PermissionsModal 
+        isOpen={showPermissionsModal} 
+        onClose={() => setShowPermissionsModal(false)}
+        onGranted={() => {
+          setHasGrantedPermissions(true);
+          setShowPermissionsModal(false);
+        }}
+      />
+
+      {/* VR split-screen — full-screen overlay */}
+      {viewMode === 'vr' && (
+        <>
+          <button className="vr-exit-btn" onClick={() => setViewMode('desktop')}>✕ Exit VR</button>
+          <VRMode
+            graphData={graphData}
+            selectedNode={selectedNode}
+            onNodeSelect={handleNodeSelect}
+            graphSize={graphSize}
+            cameraSlot={<CameraCapture ref={cameraRef} visible />}
+          />
+        </>
+      )}
+
+      {/* Processing overlay */}
       {isProcessing && (
         <ProcessingOverlay
           filename={processingFile}
@@ -163,10 +242,21 @@ function App() {
         />
       )}
 
-      <header className="app-header">
+      <header className="app-header" style={{ display: 'flex', alignItems: 'center' }}>
         <h1>Live AI Knowledge Graph Explorer</h1>
+        <div className="view-mode-bar">
+          {['desktop', 'mobile', 'vr'].map(mode => (
+            <button
+              key={mode}
+              className={`view-mode-btn${viewMode === mode ? ' active' : ''}`}
+              onClick={() => setViewMode(mode)}
+            >
+              {mode === 'desktop' ? '🖥 Desktop' : mode === 'mobile' ? '📱 Mobile' : '🥽 VR'}
+            </button>
+          ))}
+        </div>
       </header>
-      
+
       <div className="main-content">
         <div className="left-panel" ref={leftPanelRef} style={{ position: 'relative' }}>
            <GraphView 
@@ -177,18 +267,27 @@ function App() {
              width={graphSize.width}
              height={graphSize.height}
            />
-           {/* Mind map overlay — rendered on top of the 3D graph */}
+           {/* Camera PiP — shown in mobile mode */}
+           {cameraActive && viewMode === 'mobile' && (
+             <div className="camera-pip">
+               <CameraCapture ref={cameraRef} visible />
+             </div>
+           )}
+           {/* Mind map overlay */}
            {mindMapData && (
              <MindMapViewer
                mapData={mindMapData}
                onClose={() => setMindMapData(null)}
              />
            )}
-           {/* Video overlay — rendered on top of the 3D graph */}
+           {/* Video overlay */}
            {videoData && (
              <VideoViewer
                videoData={videoData}
+               onVideoPlay={(title) => liveAssistantRef.current?.notifyVideoPlaying(title, videoData?.solution_steps)}
+               onVideoPause={() => liveAssistantRef.current?.notifyVideoPaused()}
                onClose={() => {
+                 liveAssistantRef.current?.notifyVideoPaused();
                  setVideoHistory(prev => [videoData, ...prev]);
                  setVideoData(null);
                }}
@@ -197,16 +296,23 @@ function App() {
         </div>
 
         <div className="right-panel">
-          <div className="top-inputs">
-             <PDFUploader 
-               onConceptsExtracted={refreshGraph}
-               onProcessingChange={(active, name) => {
-                 setIsProcessing(active);
-                 setProcessingFile(name);
-               }}
-             />
-             <TextConceptInput onConceptsExtracted={refreshGraph} />
+          {viewMode === 'desktop' && (
+            <div className="top-inputs">
+               <PDFUploader 
+                 onConceptsExtracted={refreshGraph}
+                 onProcessingChange={(active, name) => {
+                   setIsProcessing(active);
+                   setProcessingFile(name);
+                 }}
+               />
+               <TextConceptInput onConceptsExtracted={refreshGraph} />
+            </div>
+          )}
+
+          <div className="middle-inspector">
              <GestureController
+               isActive={isGestureActive}
+               onActiveChange={setIsGestureActive}
                onSwipe={navigateDirection}
              />
           </div>
@@ -302,13 +408,13 @@ function App() {
 
           <div className="bottom-inputs">
              <LiveAssistant 
+               ref={liveAssistantRef}
                graphContainerRef={leftPanelRef}
                selectedNode={selectedNode}
                graphData={graphData}
-               onMindMapReceived={(data) => {
-                 setMindMapData(data);
-                 setMindMapHistory(prev => [data, ...prev]);
-               }}
+               cameraRef={cameraRef}
+               cameraActive={cameraActive}
+               onMindMapReceived={handleMindMapReceived}
                onVideoStatus={(msg) => {
                  if (msg.status === 'generating') {
                    setIsProcessing(true);
