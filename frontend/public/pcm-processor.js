@@ -6,9 +6,9 @@
 class PcmProcessor extends AudioWorkletProcessor {
   constructor() {
     super();
-    // 256 samples @ 16 kHz = 16 ms per chunk (was 1024 = 64 ms).
-    // Extremely small buffer for near 1-millisecond latency feel.
-    this.bufferSize = 256;
+    // 2048 samples @ 16 kHz = 128 ms per chunk.
+    // Standard buffer size to reduce WebSocket overhead while maintaining real-time feel.
+    this.bufferSize = 2048;
     this.buffer = new Float32Array(this.bufferSize);
     this.bufferIndex = 0;
   }

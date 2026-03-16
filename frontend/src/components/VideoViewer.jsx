@@ -1,6 +1,6 @@
 import React, { useEffect, useState, useRef } from 'react';
 
-export default function VideoViewer({ videoData, onClose, onVideoPlay, onVideoPause }) {
+export default function VideoViewer({ videoData, onClose, onVideoPlay, onVideoPause, id = "active-video-player" }) {
   const [visible, setVisible] = useState(false);
   const videoRef = useRef(null);
 
@@ -65,7 +65,7 @@ export default function VideoViewer({ videoData, onClose, onVideoPlay, onVideoPa
       <div style={{ flex: 1, background: '#000', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
         <video 
           ref={videoRef}
-          id="active-video-player"
+          id={id}
           src={videoData.url} 
           autoPlay 
           controls 

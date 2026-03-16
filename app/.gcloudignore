@@ -1,0 +1,12 @@
+venv/
+.env
+.git/
+.gitignore
+gemini_errors.log
+check.txt
+list_models.py
+models_bidi.txt
+models_output.txt
+node_modules/
+dist/
+venv

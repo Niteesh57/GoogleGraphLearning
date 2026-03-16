@@ -9,8 +9,11 @@ import ProcessingOverlay from './components/ProcessingOverlay';
 import MindMapViewer from './components/MindMapViewer';
 import VideoViewer from './components/VideoViewer';
 import CameraCapture from './components/CameraCapture';
+import MenuViewer from './components/MenuViewer';
+import IsolatedSection from './components/IsolatedSection';
 import VRMode from './components/VRMode';
 import PermissionsModal from './components/PermissionsModal';
+import { isMobileDevice } from './utils/device';
 import './index.css';
 
 // Mock data to ensure react-force-graph renders correctly
@@ -40,8 +43,10 @@ function App() {
   const [mindMapHistory, setMindMapHistory] = useState([]);
   const [videoData, setVideoData] = useState(null);
   const [videoHistory, setVideoHistory] = useState([]);
+  const [menuData, setMenuData] = useState(null);
+  const [isolatedSectionData, setIsolatedSectionData] = useState(null);
   // viewMode: 'desktop' | 'mobile' | 'vr'
-  const [viewMode, setViewMode] = useState('desktop');
+  const [viewMode, setViewMode] = useState(isMobileDevice() ? 'mobile' : 'desktop');
   const [cameraActive, setCameraActive] = useState(false);
   const [showPermissionsModal, setShowPermissionsModal] = useState(false);
   const [hasGrantedPermissions, setHasGrantedPermissions] = useState(false);
@@ -72,6 +77,17 @@ function App() {
     return () => ro.disconnect();
   }, []);
 
+  // VR Specific Sizing: Ensure it takes full window even if leftPanel is hidden/covered
+  useEffect(() => {
+    if (viewMode !== 'vr') return;
+    const handleResize = () => {
+       setGraphSize({ width: window.innerWidth, height: window.innerHeight });
+    };
+    handleResize(); // immediate
+    window.addEventListener('resize', handleResize);
+    return () => window.removeEventListener('resize', handleResize);
+  }, [viewMode]);
+
   // Enable camera when switching to mobile/vr
   useEffect(() => {
     const isMobileOrVR = viewMode === 'mobile' || viewMode === 'vr';
@@ -83,10 +99,6 @@ function App() {
 
     // Mobile/VR mode refinements:
     if (isMobileOrVR) {
-      // 1. Start with an empty graph for a fresh interactive experience
-      setGraphData({ nodes: [], links: [] });
-      setSelectedNode(null);
-
       // 2. Enable gestures by default in Mobile mode (for hand-free navigation)
       if (viewMode === 'mobile') {
         setIsGestureActive(true);
@@ -101,15 +113,13 @@ function App() {
      // Smoothly re-center graph on the selected node
      if (fgRef.current && node.x != null && node.y != null) {
        fgRef.current.centerAt(node.x, node.y, 600); // 600ms transition
-       fgRef.current.zoom(1.5, 600);
+       fgRef.current.zoom(viewMode === 'vr' ? 1.0 : 1.5, 600);
      }
   }, []);
 
-  // ── DIRECTIONAL NODE NAVIGATION (Arrows + Swipe) ─────────────────────────
   const navigateDirection = useCallback((direction) => {
     if (!selectedNode || !graphData || !graphData.nodes.length) return;
     
-    // Find immediate neighbors of the current selected node
     const neighbors = new Set();
     graphData.links.forEach(l => {
       const sid = typeof l.source === 'object' ? l.source.id : l.source;
@@ -119,17 +129,15 @@ function App() {
     });
 
     let bestNode = null;
-    let bestScore = Infinity; // We want lowest score (angle match)
+    let bestScore = Infinity;
 
     let targetAngle = 0;
     if (direction === "RIGHT") targetAngle = 0;
     else if (direction === "DOWN") targetAngle = Math.PI / 2;
-    // Math.atan2 can return PI or -PI for exactly left
     else if (direction === "LEFT") targetAngle = Math.PI; 
     else if (direction === "UP") targetAngle = -Math.PI / 2;
 
     graphData.nodes.forEach(n => {
-      // Only allow moving to immediate neighbors!
       if (n.id === selectedNode.id || !neighbors.has(n.id) || n.x == null || n.y == null) return;
 
       const nx = n.x - selectedNode.x;
@@ -137,11 +145,9 @@ function App() {
       const nAngle = Math.atan2(ny, nx);
       const dist = Math.sqrt(nx * nx + ny * ny);
 
-      // Angular difference between ideal swipe and node position
       let angleDiff = Math.abs(nAngle - targetAngle);
       if (angleDiff > Math.PI) angleDiff = 2 * Math.PI - angleDiff;
 
-      // Only consider nodes roughly in the same quadrant (±45 degrees)
       if (angleDiff < Math.PI / 3) {
         const score = dist * (1 + angleDiff * 2);
         if (score < bestScore) {
@@ -156,10 +162,8 @@ function App() {
     }
   }, [graphData, selectedNode, handleNodeSelect]);
 
-  // Keyboard navigation listener
   useEffect(() => {
     const handleKeyDown = (e) => {
-      // Don't intercept if user is typing in an input
       if (['INPUT', 'TEXTAREA'].includes(e.target.tagName)) return;
       
       if (e.key === 'ArrowRight') navigateDirection("RIGHT");
@@ -183,10 +187,8 @@ function App() {
       .catch(err => console.error("Could not fetch graph data", err));
   }, [selectedNode, handleNodeSelect]);
 
-  // Mind map: Gemini tells us whether to append or replace
   const handleMindMapReceived = useCallback((data) => {
     if (data.mode === 'append') {
-      // Merge nodes/links into the existing force-graph (dedup by id)
       setGraphData(prev => {
         const existingIds = new Set(prev.nodes.map(n => n.id));
         const newNodes = (data.nodes || []).filter(n => !existingIds.has(n.id));
@@ -220,7 +222,6 @@ function App() {
         }}
       />
 
-      {/* VR split-screen — full-screen overlay */}
       {viewMode === 'vr' && (
         <>
           <button className="vr-exit-btn" onClick={() => setViewMode('desktop')}>✕ Exit VR</button>
@@ -229,12 +230,24 @@ function App() {
             selectedNode={selectedNode}
             onNodeSelect={handleNodeSelect}
             graphSize={graphSize}
+            cameraRef={cameraRef}
             cameraSlot={<CameraCapture ref={cameraRef} visible />}
+            onSwipe={navigateDirection}
+            mindMapData={mindMapData}
+            setMindMapData={setMindMapData}
+            videoData={videoData}
+            setVideoData={setVideoData}
+            onVideoPlay={(title) => liveAssistantRef.current?.notifyVideoPlaying(title, videoData?.solution_steps)}
+            onVideoPause={() => liveAssistantRef.current?.notifyVideoPaused()}
+            menuData={menuData}
+            setMenuData={setMenuData}
+            isolatedSectionData={isolatedSectionData}
+            setIsolatedSectionData={setIsolatedSectionData}
+            fgRef={fgRef}
           />
         </>
       )}
 
-      {/* Processing overlay */}
       {isProcessing && (
         <ProcessingOverlay
           filename={processingFile}
@@ -243,13 +256,26 @@ function App() {
       )}
 
       <header className="app-header" style={{ display: 'flex', alignItems: 'center' }}>
-        <h1>Live AI Knowledge Graph Explorer</h1>
+        <h1>NeuroGraph LIVE</h1>
         <div className="view-mode-bar">
           {['desktop', 'mobile', 'vr'].map(mode => (
             <button
               key={mode}
               className={`view-mode-btn${viewMode === mode ? ' active' : ''}`}
-              onClick={() => setViewMode(mode)}
+              onClick={async () => {
+                if (mode === 'vr') {
+                   try {
+                     if (!document.fullscreenElement) {
+                       await document.documentElement.requestFullscreen();
+                     }
+                   } catch (e) {
+                      console.warn("Fullscreen request failed", e);
+                   }
+                } else if (document.fullscreenElement) {
+                   try { await document.exitFullscreen(); } catch (e) {}
+                }
+                setViewMode(mode);
+              }}
             >
               {mode === 'desktop' ? '🖥 Desktop' : mode === 'mobile' ? '📱 Mobile' : '🥽 VR'}
             </button>
@@ -259,28 +285,40 @@ function App() {
 
       <div className="main-content">
         <div className="left-panel" ref={leftPanelRef} style={{ position: 'relative' }}>
-           <GraphView 
-             ref={fgRef}
-             data={graphData} 
-             onNodeSelect={handleNodeSelect}
-             selectedNode={selectedNode}
-             width={graphSize.width}
-             height={graphSize.height}
-           />
-           {/* Camera PiP — shown in mobile mode */}
+           {viewMode !== 'mobile' && (
+             <GraphView 
+               ref={fgRef}
+               data={graphData} 
+               onNodeSelect={handleNodeSelect}
+               selectedNode={selectedNode}
+               width={graphSize.width}
+               height={graphSize.height}
+             />
+           )}
            {cameraActive && viewMode === 'mobile' && (
-             <div className="camera-pip">
+             <div className="camera-mobile-full">
                <CameraCapture ref={cameraRef} visible />
              </div>
            )}
-           {/* Mind map overlay */}
+           {/* Overlays */}
            {mindMapData && (
              <MindMapViewer
                mapData={mindMapData}
                onClose={() => setMindMapData(null)}
              />
            )}
-           {/* Video overlay */}
+           {menuData && (
+             <MenuViewer
+               menuData={menuData}
+               onClose={() => setMenuData(null)}
+             />
+           )}
+           {isolatedSectionData && (
+             <IsolatedSection
+               sectionData={isolatedSectionData}
+               onClose={() => setIsolatedSectionData(null)}
+             />
+           )}
            {videoData && (
              <VideoViewer
                videoData={videoData}
@@ -296,29 +334,33 @@ function App() {
         </div>
 
         <div className="right-panel">
-          {viewMode === 'desktop' && (
+          {viewMode !== 'vr' && (
             <div className="top-inputs">
-               <PDFUploader 
-                 onConceptsExtracted={refreshGraph}
-                 onProcessingChange={(active, name) => {
-                   setIsProcessing(active);
-                   setProcessingFile(name);
-                 }}
-               />
+               {viewMode !== 'mobile' && (
+                 <PDFUploader 
+                   onConceptsExtracted={refreshGraph}
+                   onProcessingChange={(active, name) => {
+                     setIsProcessing(active);
+                     setProcessingFile(name);
+                   }}
+                 />
+               )}
                <TextConceptInput onConceptsExtracted={refreshGraph} />
             </div>
           )}
 
           <div className="middle-inspector">
-             <GestureController
-               isActive={isGestureActive}
-               onActiveChange={setIsGestureActive}
-               onSwipe={navigateDirection}
-             />
+             {viewMode === 'desktop' && (
+               <GestureController
+                 isActive={isGestureActive}
+                 onActiveChange={setIsGestureActive}
+                 onSwipe={navigateDirection}
+                 sharedCamera={cameraRef}
+               />
+             )}
           </div>
 
           <div className="middle-inspector">
-             {/* Gemini Explanation box with auto-scroll */}
              <div className="gemini-response" style={{ maxHeight: '200px', overflowY: 'auto' }}>
                {geminiExplanation ? (
                  <>
@@ -335,7 +377,6 @@ function App() {
                )}
              </div>
 
-             {/* Mind Map History */}
              {mindMapHistory.length > 0 && (
                <div className="mind-map-history" style={{ 
                  marginTop: '1rem', padding: '12px', background: 'rgba(255,255,255,0.03)', 
@@ -370,7 +411,6 @@ function App() {
                </div>
              )}
 
-             {/* Video History */}
              {videoHistory.length > 0 && (
                <div className="video-history" style={{ 
                  marginTop: '1rem', padding: '12px', background: 'rgba(255,255,255,0.03)', 
@@ -415,6 +455,8 @@ function App() {
                cameraRef={cameraRef}
                cameraActive={cameraActive}
                onMindMapReceived={handleMindMapReceived}
+               onMenuReceived={setMenuData}
+               onIsolatedSection={setIsolatedSectionData}
                onVideoStatus={(msg) => {
                  if (msg.status === 'generating') {
                    setIsProcessing(true);
@@ -433,7 +475,6 @@ function App() {
                }}
                onAudioFinished={() => {
                   console.log("Audio finished! Auto-closing mind map in 1.5s...");
-                  // Keep it on screen for 1.5 seconds after speaking finishes before closing
                   setTimeout(() => setMindMapData(null), 1500);
                }}
                onTextReceived={(text) => {

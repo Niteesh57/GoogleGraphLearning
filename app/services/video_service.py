@@ -50,13 +50,27 @@ def generate_solution(prompt: str) -> dict:
 
     BANNED — these crash and must NEVER appear:
     - MathTex, Tex, DecimalNumber, Integer, Matrix
+    - get_part_by_text, get_parts_by_text, .t2c, .t2f, .t2s (any substring selection/methods)
     - Axes.add_coordinates(), NumberLine.add_numbers(), FunctionGraph, ValueTracker
     - MoveAlongPath, get_mobjects_from_last_play, .reverse(), .to_center(), self.add_sound()
-
+    
     TEXT RULES:
     - font_size=32 for titles, font_size=24 for body text. Never use default 48.
     - Max 40 characters per line. Wrap long text with "\\n" manually.
-    - Never overlap text or shapes. Use .next_to() with buff >= 0.3 between all elements.
+    - CRITICAL: Never overlap text or shapes. Use .next_to() or .arrange() with buff >= 0.4.
+    - WORD ISOLATION: To highlight or move a specific word, DO NOT use get_part_by_text. 
+      Instead, create each word as a separate Text("word") object and put them in a VGroup().arrange(RIGHT, buff=0.1).
+
+    SPATIAL AWARENESS & LAYOUT:
+    - Screen is 14 units wide (LEFT=-7 to RIGHT=7) and 8 units high (BOTTOM=-4 to TOP=4).
+    - If a scene becomes crowded, FadeOut previous elements before adding new ones.
+    - For lists or stacks of text, ALWAYS use VGroup(text1, text2, ...).arrange(DOWN, center=True, buff=0.5) to ensure zero overlap.
+    - Title should always be at .to_edge(UP). All other content should be below it.
+
+    ANIMATION RULES:
+    - GrowArrow(obj): Use ONLY for a single Arrow object. NEVER use it on a VGroup.
+    - To animate multiple arrows or a VGroup, use Create(vgroup) instead.
+    - Use run_time=1.5 or 2 for complex transformations to give the user time to see them.
 
     STRUCTURE (follow this pattern, adapt freely):
     from manim import *

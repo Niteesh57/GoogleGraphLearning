@@ -13,7 +13,7 @@ const FEATURES = [
   },
   {
     icon: '🔍',
-    title: 'Relationship Explorer',
+    title: 'NeuroGraph LIVE',
     desc: 'See how every concept links to its neighbors at a glance.',
   },
   {

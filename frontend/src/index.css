@@ -397,15 +397,17 @@ button:disabled {
 
 .vr-camera-overlay {
   position: absolute;
-  bottom: 1rem;
+  bottom: 2rem;
   left: 50%;
   transform: translateX(-50%);
   z-index: 10;
-  width: 160px;
-  height: 120px;
-  border-radius: 8px;
+  width: 140px;
+  height: 105px;
+  border-radius: 12px;
   overflow: hidden;
-  border: 2px solid rgba(255,255,255,0.3);
+  border: 1.5px solid rgba(255,255,255,0.25);
+  background: #000;
+  box-shadow: 0 8px 16px rgba(0,0,0,0.4);
 }
 
 .camera-pip {
@@ -432,17 +434,22 @@ button:disabled {
 
 .vr-exit-btn {
   position: fixed;
-  top: 1rem;
-  left: 50%;
-  transform: translateX(-50%);
+  top: 1.5rem;
+  right: 1.5rem;
   z-index: 9100;
-  background: rgba(0,0,0,0.6);
+  background: rgba(0,0,0,0.55);
   color: white;
-  border: 1px solid rgba(255,255,255,0.3);
-  padding: 0.4rem 1rem;
-  border-radius: 9999px;
-  font-size: 0.8rem;
+  border: 1px solid rgba(255,255,255,0.2);
+  padding: 0.5rem 1rem;
+  border-radius: 8px;
+  font-size: 0.85rem;
   cursor: pointer;
+  backdrop-filter: blur(8px);
+  transition: background 0.2s;
+}
+
+.vr-exit-btn:hover {
+  background: rgba(220, 38, 38, 0.8);
 }
 
 /* ===================================================================
@@ -490,7 +497,6 @@ button:disabled {
   text-align: center;
 }
 
-/* Camera pip (picture-in-picture) in normal mode */
 .camera-pip {
   position: absolute;
   bottom: 1.5rem;
@@ -502,6 +508,13 @@ button:disabled {
   border: 2px solid rgba(99,102,241,0.6);
   box-shadow: 0 4px 20px rgba(0,0,0,0.3);
   z-index: 50;
+}
+
+.camera-mobile-full {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  background: #000;
 }
 
 /* ===================================================================
@@ -523,8 +536,8 @@ button:disabled {
 
   .left-panel {
     flex: none;
-    height: 55vw;           /* compact graph on mobile */
-    min-height: 240px;
+    height: 70vh;           /* larger focus on camera/video on mobile */
+    min-height: 350px;
     border-right: none;
     border-bottom: 1px solid var(--border);
   }
@@ -532,7 +545,7 @@ button:disabled {
   .right-panel {
     min-width: unset;
     max-width: unset;
-    flex: 1;
+    flex: none;             /* let it grow as needed */
     padding: 1rem;
     gap: 1rem;
   }

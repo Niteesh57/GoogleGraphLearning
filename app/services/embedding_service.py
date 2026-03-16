@@ -4,6 +4,8 @@ from typing import List
 
 class EmbeddingService:
     def __init__(self):
+        from dotenv import load_dotenv
+        load_dotenv(os.path.join(os.path.dirname(__file__), "..", ".env"))
         api_key = os.getenv("GEMINI_API_KEY")
         self.client = genai.Client(api_key=api_key)
 

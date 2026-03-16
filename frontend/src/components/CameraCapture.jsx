@@ -61,11 +61,15 @@ const CameraCapture = forwardRef(function CameraCapture({ visible = true, classN
     canvas.height = video.videoHeight || 480;
     canvas.getContext('2d').drawImage(video, 0, 0, canvas.width, canvas.height);
     // Return base64-encoded JPEG (strip the data-URI prefix)
-    return canvas.toDataURL('image/jpeg', 0.7).split(',')[1];
+    return canvas.toDataURL('image/jpeg', 0.5).split(',')[1];
   }, []);
 
   // Expose capture + facingMode to parent through ref
-  useImperativeHandle(ref, () => ({ captureCurrentFrame, facingMode }), [captureCurrentFrame, facingMode]);
+  useImperativeHandle(ref, () => ({ 
+    captureCurrentFrame, 
+    facingMode,
+    get videoElement() { return videoRef.current; }
+  }), [captureCurrentFrame, facingMode]);
 
   if (!visible) return null;
 

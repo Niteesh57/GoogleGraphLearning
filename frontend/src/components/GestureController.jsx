@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 
 const smooth = (prev, next) => prev * 0.7 + next * 0.3;
 
-export default function GestureController({ onSwipe, isActive: propActive, onActiveChange }) {
+export default function GestureController({ onSwipe, isActive: propActive, onActiveChange, sharedCamera }) {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
   
@@ -52,7 +52,10 @@ export default function GestureController({ onSwipe, isActive: propActive, onAct
       const canvas = canvasRef.current;
       const ctx = canvas.getContext('2d');
       ctx.save();
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      // Only clear if we are NOT drawing the shared video ourselves
+      if (!(sharedCamera && sharedCamera.current && sharedCamera.current.videoElement)) {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }
 
       if (!results.multiHandLandmarks?.length) {
         state.current.prevCursorX = null;
@@ -115,25 +118,61 @@ export default function GestureController({ onSwipe, isActive: propActive, onAct
       }
     });
 
-    const camera = new window.Camera(videoRef.current, {
-      onFrame: async () => {
-        if (!destroyed) await hands.send({ image: videoRef.current });
-      },
-      width: 320,
-      height: 240
-    });
+    let cameraInstance = null;
+    let rafId = null;
 
-    camera.start();
+    if (sharedCamera && sharedCamera.current && sharedCamera.current.videoElement) {
+      const sharedVideo = sharedCamera.current.videoElement;
+      
+      const processFrame = async () => {
+         if (destroyed) return;
+         if (sharedVideo.readyState >= 2 && !sharedVideo.paused && !sharedVideo.ended) {
+            try {
+               // Draw the shared video onto the canvas first (scaled and transformed)
+               if (canvasRef.current) {
+                 const ctx = canvasRef.current.getContext('2d');
+                 ctx.save();
+                 ctx.scale(-1, 1); // mirror
+                 ctx.drawImage(sharedVideo, -canvasRef.current.width, 0, canvasRef.current.width, canvasRef.current.height);
+                 ctx.restore();
+               }
+               // Send to MediaPipe
+               await hands.send({ image: sharedVideo });
+            } catch (e) {
+               console.error("Hands send error", e);
+            }
+         }
+         if (!destroyed) {
+           rafId = requestAnimationFrame(processFrame);
+         }
+      };
+      
+      // Delay slightly so video has time to play
+      setTimeout(() => {
+         if (!destroyed) rafId = requestAnimationFrame(processFrame);
+      }, 500);
+
+    } else {
+      cameraInstance = new window.Camera(videoRef.current, {
+        onFrame: async () => {
+          if (!destroyed) await hands.send({ image: videoRef.current });
+        },
+        width: 320,
+        height: 240
+      });
+      cameraInstance.start();
+    }
 
     return () => {
       destroyed = true;
       state.current.prevCursorX = null;
       state.current.prevCursorY = null;
       state.current.prevPinchDist = null;
-      camera.stop();
+      if (cameraInstance) cameraInstance.stop();
+      if (rafId) cancelAnimationFrame(rafId);
       try { hands.close(); } catch (e) { }
     };
-  }, [isActive]); 
+  }, [isActive, sharedCamera]); 
 
   return (
     <div className="input-panel-card gesture-card">
@@ -153,15 +192,17 @@ export default function GestureController({ onSwipe, isActive: propActive, onAct
         </div>
       )}
       <div style={{ position: 'relative', width: '100%', aspectRatio: '4/3', display: isActive ? 'block' : 'none' }}>
-        <video
-          ref={videoRef}
-          style={{ position: 'absolute', width: '100%', height: '100%', objectFit: 'cover', transform: 'scaleX(-1)' }}
-        />
+        {!(sharedCamera && sharedCamera.current && sharedCamera.current.videoElement) && (
+          <video
+            ref={videoRef}
+            style={{ position: 'absolute', width: '100%', height: '100%', objectFit: 'cover', transform: 'scaleX(-1)' }}
+          />
+        )}
         <canvas
           ref={canvasRef}
           width={320}
           height={240}
-          style={{ position: 'absolute', width: '100%', height: '100%', zIndex: 1, transform: 'scaleX(-1)' }}
+          style={{ position: 'absolute', width: '100%', height: '100%', zIndex: 1 }}
         />
       </div>
     </div>

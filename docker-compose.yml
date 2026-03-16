@@ -1,0 +1,23 @@
+services:
+  backend:
+    build:
+      context: ./app
+      dockerfile: Dockerfile
+    ports:
+      - "8080:8080"
+    environment:
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+    volumes:
+      - ./app/chroma_data:/app/chroma_data
+      - ./app/.generated_videos:/app/.generated_videos
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_URL=http://localhost:8080
+    ports:
+      - "80:80"
+    depends_on:
+      - backend

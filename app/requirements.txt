@@ -9,6 +9,5 @@ scikit-learn
 numpy<2.0
 python-dotenv
 networkx
-sentence-transformers
 pdfminer.six
 manim

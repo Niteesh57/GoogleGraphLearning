@@ -1,8 +1,15 @@
 import React, { useState, useEffect, useRef, useImperativeHandle, forwardRef } from 'react';
 import * as base64js from 'base64-js';
+import { isMobileDevice } from '../utils/device';
 
 const SESSION_ID_KEY = 'vr_session_id';
 function getOrCreateSessionId() {
+  if (isMobileDevice()) {
+    // For mobile, always clear the session on refresh
+    const newId = crypto.randomUUID();
+    localStorage.setItem(SESSION_ID_KEY, newId);
+    return newId;
+  }
   let id = localStorage.getItem(SESSION_ID_KEY);
   if (!id) {
     id = crypto.randomUUID();
@@ -11,7 +18,7 @@ function getOrCreateSessionId() {
   return id;
 }
 
-const LiveAssistant = forwardRef(({ onStateChange, graphContainerRef, onTextReceived, onMindMapReceived, onVideoStatus, onVideoReady, onVideoError, onAudioFinished, selectedNode, graphData, cameraRef, cameraActive }, ref) => {
+const LiveAssistant = forwardRef(({ onStateChange, graphContainerRef, onTextReceived, onMindMapReceived, onMenuReceived, onIsolatedSection, onVideoStatus, onVideoReady, onVideoError, onAudioFinished, selectedNode, graphData, cameraRef, cameraActive, preAcquiredStream }, ref) => {
   // Track whether a video is actively playing so frame capture loop knows to send frames
   const isVideoPlayingRef = useRef(false);
   const videoTitleRef = useRef(null);
@@ -190,7 +197,9 @@ const LiveAssistant = forwardRef(({ onStateChange, graphContainerRef, onTextRece
       
       // Open WebSocket directly to our backend proxy instead of Google
       const baseUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-      const wsUrl = baseUrl.replace(/^http/, 'ws');
+      const isSecure = window.location.protocol === 'https:';
+      const wsProtocol = isSecure ? 'wss' : 'ws';
+      const wsUrl = baseUrl.replace(/^https?/, wsProtocol);
       const url = `${wsUrl}/live/ws-realtime`;
       const ws = new WebSocket(url);
       wsRef.current = ws;
@@ -282,18 +291,32 @@ const LiveAssistant = forwardRef(({ onStateChange, graphContainerRef, onTextRece
       audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: 16000
       });
+      // CRITICAL for Mobile: Resume context inside user gesture
+      if (audioContextRef.current.state === 'suspended') {
+        await audioContextRef.current.resume();
+      }
 
       // Load our custom Worklet that grabs raw PCM
       await audioContextRef.current.audioWorklet.addModule('/pcm-processor.js');
+      
+      // Force resume early for mobile
+      if (audioContextRef.current.state === 'suspended') {
+        await audioContextRef.current.resume();
+      }
 
-      mediaStreamRef.current = await navigator.mediaDevices.getUserMedia({ 
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          autoGainControl: true,
-          noiseSuppression: true
-        } 
-      });
+      // Reuse the pre-acquired stream's audio track if possible
+      if (preAcquiredStream && preAcquiredStream.getAudioTracks().length > 0) {
+          mediaStreamRef.current = new MediaStream([preAcquiredStream.getAudioTracks()[0]]);
+      } else {
+          mediaStreamRef.current = await navigator.mediaDevices.getUserMedia({ 
+            audio: {
+              channelCount: 1,
+              echoCancellation: true,
+              autoGainControl: true,
+              noiseSuppression: true
+            } 
+          });
+      }
 
       const source = audioContextRef.current.createMediaStreamSource(mediaStreamRef.current);
       workletNodeRef.current = new AudioWorkletNode(audioContextRef.current, 'pcm-processor');
@@ -325,32 +348,23 @@ const LiveAssistant = forwardRef(({ onStateChange, graphContainerRef, onTextRece
           firstResponseLoggedRef.current = false;
           console.log('%c[⚡ SPIKE] Voice detected — flushed Gemini playback instantly.', 'color:#f90;font-weight:bold');
 
-          // If camera is active, send the current frame so Gemini sees the book page
-          if (cameraActive && cameraRef?.current) {
-            const frameB64 = cameraRef.current.captureCurrentFrame();
-            if (frameB64 && wsRef.current?.readyState === WebSocket.OPEN) {
-              wsRef.current.send(JSON.stringify({
-                realtimeInput: {
-                  mediaChunks: [{ mimeType: 'image/jpeg', data: frameB64 }]
-                }
-              }));
-            }
-          }
+          // Frame capture on spike removed to keep session stable (periodic 4s heartbeat covers context)
         } else if (!speakingNow && isSpeakingRef.current) {
           isSpeakingRef.current = false;
         }
 
         // ── Always stream all audio frames to Gemini (including silence) ──
         // Gemini's VAD needs the silence to detect end-of-turn and respond.
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          const uint8 = new Uint8Array(int16PcmBuffer);
-          const base64Data = base64js.fromByteArray(uint8);
-          wsRef.current.send(JSON.stringify({
-            realtimeInput: {
-              mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: base64Data }]
-            }
-          }));
-        }
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            const uint8 = new Uint8Array(int16PcmBuffer);
+            const base64Data = base64js.fromByteArray(uint8);
+            // console.debug(`[Mobile] Sending ${uint8.length} bytes of audio`);
+            wsRef.current.send(JSON.stringify({
+              realtimeInput: {
+                mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: base64Data }]
+              }
+            }));
+          }
       };
 
       source.connect(workletNodeRef.current);
@@ -503,12 +517,48 @@ const LiveAssistant = forwardRef(({ onStateChange, graphContainerRef, onTextRece
     return () => clearInterval(interval);
   }, [isConnected, isRecording]);
 
+  // --- PERIODIC CAMERA CAPTURE (Every 2s) ---
+  // Sends the user's real camera feed to Gemini periodically so it always has context.
+  useEffect(() => {
+    if (!isConnected || !isRecording || !cameraActive) return;
+
+    const interval = setInterval(() => {
+      // Don't flood if a video is already occupying the visual focus
+      if (isVideoPlayingRef.current) return;
+
+      if (wsRef.current?.readyState === WebSocket.OPEN && cameraRef?.current) {
+        const frameB64 = cameraRef.current.captureCurrentFrame();
+        if (frameB64) {
+          wsRef.current.send(JSON.stringify({
+            realtimeInput: {
+              mediaChunks: [{ mimeType: 'image/jpeg', data: frameB64 }]
+            }
+          }));
+        }
+      }
+    }, 4000); // Once every 4 seconds (Stability fix: higher frequency causes 1011 error)
+
+    return () => clearInterval(interval);
+  }, [isConnected, isRecording, cameraActive]);
+
   // --- AUDIO RECEIVE AND PLAYBACK ---
   const handleServerMessage = (msg) => {
     // Mind map data from Gemini tool call — forward to App
     if (msg.type === 'mind_map') {
       console.log('[MindMap] Received mind map:', msg.data?.title);
       onMindMapReceived?.(msg.data);
+      return;
+    }
+
+    if (msg.type === 'isolated_menu') {
+      console.log('[Menu] Received isolated menu:', msg.data?.title);
+      onMenuReceived?.(msg.data);
+      return;
+    }
+
+    if (msg.type === 'isolated_section') {
+      console.log('[Section] Received isolated section:', msg.data?.title);
+      onIsolatedSection?.(msg.data);
       return;
     }
 
@@ -655,13 +705,23 @@ const LiveAssistant = forwardRef(({ onStateChange, graphContainerRef, onTextRece
 
   return (
     <div className="live-assistant-panel" style={{ padding: '0.75rem', background: 'transparent', border: 'none' }}>
+      <style>{`
+        @keyframes assistant-pulse {
+          0% { transform: scale(1); opacity: 1; box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4); }
+          50% { transform: scale(1.15); opacity: 0.8; box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
+          100% { transform: scale(1); opacity: 1; }
+        }
+      `}</style>
       <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', color: '#94a3b8', justifyContent: 'center' }}>
         {error ? (
           <span style={{ color: '#ef4444' }}>❌ {error}</span>
         ) : isRecording ? (
           <>
-            <div style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: '#10b981', animation: 'pulse 2s infinite' }} />
-            <span>Live AI Tutor Active</span>
+            <div style={{ 
+              width: 10, height: 10, borderRadius: '50%', backgroundColor: '#10b981', 
+              animation: 'assistant-pulse 1.5s infinite ease-in-out' 
+            }} />
+            <span style={{ color: '#10b981', fontWeight: '500' }}>Live AI Tutor Listening...</span>
           </>
         ) : isConnected ? (
           <button 

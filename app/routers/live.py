@@ -171,6 +171,57 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
                         required=["prompt"]
                     )
                 ),
+                types.FunctionDeclaration(
+                    name="create_menu",
+                    description=(
+                        "Analyze a screenshot and create a 'menu' of interactive options or concepts. "
+                        "Call this when the user mentions 'create a menu', 'show options from this screen', "
+                        "or 'isolated version menu'."
+                    ),
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "title": types.Schema(type=types.Type.STRING, description="The title of the menu."),
+                            "items": types.Schema(
+                                type=types.Type.ARRAY,
+                                description="Actionable items or concepts extracted from the image.",
+                                items=types.Schema(
+                                    type=types.Type.OBJECT,
+                                    properties={
+                                        "id": types.Schema(type=types.Type.STRING, description="Unique item ID."),
+                                        "label": types.Schema(type=types.Type.STRING, description="Display text."),
+                                        "action": types.Schema(type=types.Type.STRING, description="What this item does (e.g. 'explore', 'deep dive', 'show video').")
+                                    },
+                                    required=["id", "label"]
+                                )
+                            )
+                        },
+                        required=["title", "items"]
+                    )
+                ),
+                types.FunctionDeclaration(
+                    name="generate_isolated_section",
+                    description=(
+                        "Generate a completely new 'isolated section' or 'app module' based on visual input. "
+                        "Call this when the user says 'generate a section', 'create an app section', "
+                        "or 'make a whole section from this'."
+                    ),
+                    parameters=types.Schema(
+                        type=types.Type.OBJECT,
+                        properties={
+                            "title": types.Schema(type=types.Type.STRING, description="Title of the new section."),
+                            "content_type": types.Schema(
+                                type=types.Type.STRING, 
+                                description="Type of section: 'interactive_quiz', 'concept_deep_dive', 'functional_module'."
+                            ),
+                            "payload": types.Schema(
+                                type=types.Type.OBJECT,
+                                description="JSON payload containing the structure/content for the section."
+                            )
+                        },
+                        required=["title", "content_type", "payload"]
+                    )
+                ),
             ]
         )],
         response_modalities=["AUDIO"],
@@ -188,20 +239,28 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
                 "You are a conversational AI tutor embedded in a live Knowledge Graph explorer. "
                 "The user's screen (graph images) and microphone audio are streamed to you in real time. "
                 "You may also receive images from the user's camera (e.g. pages of a book) — treat these as visual context for learning. "
-                "CORE CAPABILITY: Interactive Camera Mapping. "
-                "- If the user says 'capture this and generate a map', 'read this page and make a map', etc., "
-                "  look at the most recent camera image provided. "
-                "  Analyze the text or concepts on that page/image and call `create_mind_map`. "
-                "- Decision Logic: If the user says 'add this to the current map', use mode='append'. "
-                "  If they say 'make a new map', use mode='new'. If ambiguous, ask or default to 'new'. "
+                "CORE CAPABILITY: Proactive Interactive Mapping. "
+                "- If the user shows a page or concept, automatically read it and call `create_mind_map`. "
+                "- LINKING LOGIC: Always favor mode='append' to add to the existing study graph unless the user explicitly asks for a 'new' map. "
+                "- When appending, try to find 1-2 connections (links) between the NEW concepts and the EXISTING concepts in the graph. "
+                "- If you see content that is completely irrelevant to the main topic (e.g. a different chapter, random notes), "
+                "  still create the nodes, but DO NOT link them to the main cluster; let them form a separate cluster in the same graph. "
                 "RULES FOR INTERACTION: "
-                "- ALWAYS keep each response to 1-2 short sentences. Never deliver a long lecture. "
+                "- For general navigation and small updates, keep responses to 1-2 short sentences. "
+                "- EXCEPTION: When explaining a NEW Mind Map or deep-diving into concepts, be rich, detailed, and providing in-depth knowledge. "
                 "- If the user navigates a node, announce it simply. "
                 "- If they ask a question about the book/camera view, answer directly. "
+                "- DO NOT mention numerical distances or coordinates (e.g., 'distance: 0.1') in your verbal responses. Speak qualitatively. "
                 "MIND MAP RULES: "
-                "- Before calling the tool, say 'Let me read that for you...' or 'Mapping those concepts now...' "
-                "- Explain the map structure after it appears. Conversationally describe the links. "
+                "- Before calling the tool, say 'Let me read that for you...' or 'Adding those concepts to our graph...' "
+                "- After the map appears, give a detailed architectural explanation of the nodes and their relationships. "
+                "- Explain WHY the concepts are linked. Don't just list them. Give the student deep insights. "
                 "- Root node id must be 'root'. "
+                "ISOLATED MENU RULES: "
+                "- If the user wants a 'menu' or 'isolated screen', capture the screenshot and call `create_menu`. "
+                "- If the user wants a 'whole section' or 'new app module', call `generate_isolated_section`. "
+                "VISUAL CONTEXT RULES: "
+                "- You receive a periodic (every 2 seconds) visual heartbeat from the user's camera. Use this to maintain context proactively. "
                 "VIDEO NARRATION RULES: "
                 "- During video playback, provide a continuous frame-by-frame narration. Ignore the short response rule."
             )
@@ -284,15 +343,22 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
 
             async def receive_from_gemini():
                 """Relay Gemini responses and tool calls back to frontend."""
+                is_interrupted = False  # Track interruption state for deduplication
                 try:
                     while True:
                         turn = session.receive()
                         async for chunk in turn:
+                            # Reset interruption flag on new response chunks
+                            if chunk.server_content and (chunk.server_content.model_turn or chunk.server_content.turn_complete):
+                                is_interrupted = False
+
                             # 1. ALWAYS check for interruption FIRST — before any audio forwarding
                             #    so the frontend can flush its buffer before stale audio arrives.
                             if chunk.server_content and chunk.server_content.interrupted:
-                                logging.info("Gemini interrupted — signalling frontend to flush.")
-                                await websocket.send_json({"interrupted": True})
+                                if not is_interrupted:
+                                    logging.info("Gemini interrupted — signalling frontend to flush.")
+                                    await websocket.send_json({"interrupted": True})
+                                    is_interrupted = True
 
                             # 2. Handle Tool Calls
                             if chunk.tool_call:
@@ -379,6 +445,26 @@ async def live_agent_realtime_endpoint(websocket: WebSocket):
                                                 "message": "Video generation has started silently in the background. Tell the user it is rendering and ask them to stand by for a few moments."
                                             }
 
+                                        elif call.name == "create_menu":
+                                            logging.info(f"create_menu called: title='{call.args.get('title')}'")
+                                            await websocket.send_json({
+                                                "type": "isolated_menu",
+                                                "data": dict(call.args)
+                                            })
+                                            result = {
+                                                "status": "success",
+                                                "message": "Menu has been displayed as a new screen."
+                                            }
+                                        elif call.name == "generate_isolated_section":
+                                            logging.info(f"generate_isolated_section called: title='{call.args.get('title')}'")
+                                            await websocket.send_json({
+                                                "type": "isolated_section",
+                                                "data": dict(call.args)
+                                            })
+                                            result = {
+                                                "status": "success",
+                                                "message": "The new isolated section has been generated and displayed."
+                                            }
                                         else:
                                             result = {"error": f"Unknown tool: {call.name}"}
 
