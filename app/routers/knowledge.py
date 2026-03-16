@@ -1,6 +1,6 @@
 from fastapi import APIRouter, File, UploadFile, HTTPException, Form
 from pydantic import BaseModel
-from services.knowledge_service import knowledge_engine
+from app.services.knowledge_service import knowledge_engine
 
 router = APIRouter(prefix="/api", tags=["knowledge"])
 

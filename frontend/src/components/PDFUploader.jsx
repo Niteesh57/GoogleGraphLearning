@@ -15,7 +15,7 @@ export default function PDFUploader({ onConceptsExtracted, onProcessingChange })
     formData.append('file', file);
 
     try {
-      const res = await fetch('http://localhost:8000/api/upload-pdf', {
+      const res = await fetch(`${import.meta.env.VITE_API_URL}/api/upload-pdf`, {
         method: 'POST',
         body: formData,
       });

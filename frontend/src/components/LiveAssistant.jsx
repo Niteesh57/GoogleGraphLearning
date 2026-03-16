@@ -1,7 +1,124 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useImperativeHandle, forwardRef } from 'react';
 import * as base64js from 'base64-js';
+import { isMobileDevice } from '../utils/device';
 
-const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selectedNode, graphData }) => {
+const SESSION_ID_KEY = 'vr_session_id';
+function getOrCreateSessionId() {
+  if (isMobileDevice()) {
+    // For mobile, always clear the session on refresh
+    const newId = crypto.randomUUID();
+    localStorage.setItem(SESSION_ID_KEY, newId);
+    return newId;
+  }
+  let id = localStorage.getItem(SESSION_ID_KEY);
+  if (!id) {
+    id = crypto.randomUUID();
+    localStorage.setItem(SESSION_ID_KEY, id);
+  }
+  return id;
+}
+
+const LiveAssistant = forwardRef(({ onStateChange, graphContainerRef, onTextReceived, onMindMapReceived, onMenuReceived, onIsolatedSection, onVideoStatus, onVideoReady, onVideoError, onAudioFinished, selectedNode, graphData, cameraRef, cameraActive, preAcquiredStream }, ref) => {
+  // Track whether a video is actively playing so frame capture loop knows to send frames
+  const isVideoPlayingRef = useRef(false);
+  const videoTitleRef = useRef(null);
+  const wsRef = useRef(null);
+  const audioContextRef = useRef(null);
+  const mediaStreamRef = useRef(null);
+  const workletNodeRef = useRef(null);
+  // Narration keepalive: sends timed script segments so Gemini narrates the FULL video
+  const narrationKeepaliveRef = useRef(null);
+  const narrationSegmentsRef = useRef([]);  // Array of {text, delay}
+  const narrationIndexRef = useRef(0);
+
+  // Parse solution_steps string into timed narration segments
+  const parseSolutionSteps = (steps, videoDurationSec = 120) => {
+    if (!steps) return [];
+    // Split by newlines or step markers
+    const raw = steps.split(/\n|Step \d+:/i).map(s => s.trim()).filter(s => s.length > 10);
+    if (raw.length === 0) return [];
+    const intervalSec = Math.max(6, Math.floor(videoDurationSec / raw.length));
+    return raw.map((text, i) => ({ text, delay: i * intervalSec * 1000 }));
+  };
+
+  // Expose imperative methods so App.jsx can call from VideoViewer callbacks
+  useImperativeHandle(ref, () => ({
+    notifyVideoPlaying: (title, solutionSteps) => {
+      isVideoPlayingRef.current = true;
+      videoTitleRef.current = title;
+
+      if (wsRef.current?.readyState !== WebSocket.OPEN) return;
+
+      // 1. Parse solution steps into narration segments timed across the video
+      const videoEl = document.getElementById('active-video-player');
+      const duration = videoEl?.duration || 120; // fallback to 2 minutes
+      const segments = parseSolutionSteps(solutionSteps, duration);
+      narrationSegmentsRef.current = segments;
+      narrationIndexRef.current = 0;
+
+      // 2. Send the opening narration instruction to Gemini
+      const openingMsg = [
+        `[VIDEO NARRATION START] A video titled "${title || 'Animation'}" is now playing.`,
+        `You are a live teacher narrator. Your job is to explain this video continuously for its FULL duration (${Math.round(duration)} seconds).`,
+        `CRITICAL RULES:`,
+        `- You will receive both video frames AND narration script segments as the video progresses.`,
+        `- When you receive a [NARRATE NOW] message with script content, speak that content naturally and then WAIT for the next one.`,
+        `- When you receive a video frame image, use it to describe what you visually see HAPPENING right now.`,
+        `- DO NOT stop speaking until you receive [VIDEO NARRATION END].`,
+        `- Keep your tone like a friendly teacher explaining concepts step by step.`,
+        `- IGNORE the 1-2 sentence limit completely for the duration of this video.`,
+      ].join(' ');
+      wsRef.current.send(JSON.stringify({
+        clientContent: { turns: [{ role: 'user', parts: [{ text: openingMsg }] }], turnComplete: true }
+      }));
+
+      // 3. Stop any existing keepalive
+      if (narrationKeepaliveRef.current) clearInterval(narrationKeepaliveRef.current);
+
+      // 4. Start the narration keepalive loop
+      // Every 8s, send the next script segment as a new user-turn so Gemini keeps talking
+      narrationKeepaliveRef.current = setInterval(() => {
+        if (!isVideoPlayingRef.current || wsRef.current?.readyState !== WebSocket.OPEN) {
+          clearInterval(narrationKeepaliveRef.current);
+          return;
+        }
+        const videoEl = document.getElementById('active-video-player');
+        if (videoEl && videoEl.ended) {
+          // Video ended — send final message and stop
+          wsRef.current.send(JSON.stringify({
+            clientContent: { turns: [{ role: 'user', parts: [{ text: '[VIDEO NARRATION END] The video has finished. Give a one-sentence summary and stop.' }] }], turnComplete: true }
+          }));
+          clearInterval(narrationKeepaliveRef.current);
+          return;
+        }
+
+        // Send the next narration segment (or a generic continue prompt if we ran out)
+        const segments = narrationSegmentsRef.current;
+        const idx = narrationIndexRef.current;
+        let prompt;
+        if (segments.length > 0 && idx < segments.length) {
+          prompt = `[NARRATE NOW] ${segments[idx].text}`;
+          narrationIndexRef.current += 1;
+        } else {
+          // Fallback: ask Gemini to narrate what it sees in the current frame
+          prompt = `[NARRATE NOW] Describe what is visually happening in the video right now. Explain it clearly for a student.`;
+        }
+        wsRef.current.send(JSON.stringify({
+          clientContent: { turns: [{ role: 'user', parts: [{ text: prompt }] }], turnComplete: true }
+        }));
+      }, 8000); // Every 8 seconds — keeps Gemini speaking continuously
+    },
+
+    notifyVideoPaused: () => {
+      isVideoPlayingRef.current = false;
+      videoTitleRef.current = null;
+      // Stop the keepalive loop immediately when video pauses/ends
+      if (narrationKeepaliveRef.current) {
+        clearInterval(narrationKeepaliveRef.current);
+        narrationKeepaliveRef.current = null;
+      }
+    }
+  }));
   const [isConnected, setIsConnected] = useState(false);
   const [isRecording, setIsRecording] = useState(false);
   const [error, setError] = useState(null);
@@ -13,32 +130,44 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selec
       hasStartedRef.current = true;
       connect();
     }
+
+    // Handle background/foreground transitions for mobile
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        console.log('[Mobile] App returned to foreground. Resuming contexts...');
+        if (playbackContextRef.current?.state === 'suspended') {
+          playbackContextRef.current.resume().catch(console.error);
+        }
+        if (audioContextRef.current?.state === 'suspended') {
+          audioContextRef.current.resume().catch(console.error);
+        }
+        // Signal backend if needed or just let the next audio chunk trigger it
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisibilityChange);
+
     return () => {
       disconnect();
       hasStartedRef.current = false;
+      document.removeEventListener('visibilitychange', handleVisibilityChange);
     };
   }, []);
 
-  // ── AUTO-RECORD WHEN CONNECTED ────────────────────────────────────────
-  useEffect(() => {
-    if (isConnected && !isRecording && !error) {
-      startRecording();
-    }
-  }, [isConnected, isRecording, error]);
-  
-  const wsRef = useRef(null);
-  const audioContextRef = useRef(null);
-  const mediaStreamRef = useRef(null);
-  const workletNodeRef = useRef(null);
-
+  // ── 🚫 AUTO-RECORD REMOVED to satisfy Chrome Autoplay Policy
+  // AudioContext creation must be triggered by a direct user gesture.
   // VAD state — track whether the user is currently speaking
   const isSpeakingRef = useRef(false);
-  const VAD_THRESHOLD = 300; // RMS amplitude out of 32768 — adjust up to reduce sensitivity
+  // Threshold raised from 300 → 1500: 300 was firing on fan/ambient noise, causing
+  // a canvas JPEG to be sent on nearly every audio callback. This flooded the backend.
+  const VAD_THRESHOLD = 1500;
+
+  // Latency tracking
+  const lastSpikeTimeRef = useRef(null);   // performance.now() at the moment user speaks
+  const firstResponseLoggedRef = useRef(false); // whether we already logged the round-trip for this turn
   
   // To play back audio from Gemini
   const playbackContextRef = useRef(null);
   const playbackQueueRef = useRef([]);
-  const isPlayingRef = useRef(false);
   // Track active BufferSourceNodes so we can stop them on interrupt
   const activeSourceNodesRef = useRef([]);
   // Monotonic counter — increments on every interruption so stale audio is ignored
@@ -67,7 +196,11 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selec
       setError(null);
       
       // Open WebSocket directly to our backend proxy instead of Google
-      const url = `ws://localhost:8000/live/ws-realtime`;
+      const baseUrl = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+      const isSecure = window.location.protocol === 'https:';
+      const wsProtocol = isSecure ? 'wss' : 'ws';
+      const wsUrl = baseUrl.replace(/^https?/, wsProtocol);
+      const url = `${wsUrl}/live/ws-realtime`;
       const ws = new WebSocket(url);
       wsRef.current = ws;
 
@@ -75,6 +208,19 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selec
         if (wsRef.current !== ws) return;
         setIsConnected(true);
         onStateChange?.('connected');
+
+        // Send session identity immediately so backend can restore memory context
+        const sessionId = getOrCreateSessionId();
+        ws.send(JSON.stringify({ type: 'init', sessionId }));
+        console.log(`[Session] Identified as ${sessionId}`);
+        
+        // If we reconnected during an active session, automatically resume capture
+        if (hasStartedRef.current) {
+          console.log("Reconnected successfully. Resuming capture...");
+          setTimeout(() => {
+            startRecording();
+          }, 100);
+        }
       };
 
       ws.onclose = () => {
@@ -84,14 +230,17 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selec
         cleanupAudio();
         onStateChange?.('disconnected');
         
+        // Nullify reference so the timeout knows it's safe to spawn a new socket
+        wsRef.current = null;
+        
         // Auto-reconnect to maintain "Always On" state if we didn't deliberately disconnect
         if (hasStartedRef.current) {
-          console.log("WebSocket closed unexpectedly. Reconnecting in 1 second...");
+          console.log("WebSocket closed unexpectedly. Reconnecting in 5 seconds...");
           setTimeout(() => {
             if (hasStartedRef.current && !wsRef.current) {
               connect();
             }
-          }, 1000);
+          }, 5000);
         }
       };
 
@@ -135,24 +284,39 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selec
 
   // --- AUDIO CAPTURE AND SEND ---
   const startRecording = async () => {
-    if (!isConnected) return;
+    // We check wsRef instead of isConnected state because state updates are async
+    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
     try {
       // Create a 16kHz audio context as required by Gemini
       audioContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
         sampleRate: 16000
       });
+      // CRITICAL for Mobile: Resume context inside user gesture
+      if (audioContextRef.current.state === 'suspended') {
+        await audioContextRef.current.resume();
+      }
 
       // Load our custom Worklet that grabs raw PCM
       await audioContextRef.current.audioWorklet.addModule('/pcm-processor.js');
+      
+      // Force resume early for mobile
+      if (audioContextRef.current.state === 'suspended') {
+        await audioContextRef.current.resume();
+      }
 
-      mediaStreamRef.current = await navigator.mediaDevices.getUserMedia({ 
-        audio: {
-          channelCount: 1,
-          echoCancellation: true,
-          autoGainControl: true,
-          noiseSuppression: true
-        } 
-      });
+      // Reuse the pre-acquired stream's audio track if possible
+      if (preAcquiredStream && preAcquiredStream.getAudioTracks().length > 0) {
+          mediaStreamRef.current = new MediaStream([preAcquiredStream.getAudioTracks()[0]]);
+      } else {
+          mediaStreamRef.current = await navigator.mediaDevices.getUserMedia({ 
+            audio: {
+              channelCount: 1,
+              echoCancellation: true,
+              autoGainControl: true,
+              noiseSuppression: true
+            } 
+          });
+      }
 
       const source = audioContextRef.current.createMediaStreamSource(mediaStreamRef.current);
       workletNodeRef.current = new AudioWorkletNode(audioContextRef.current, 'pcm-processor');
@@ -160,43 +324,47 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selec
       workletNodeRef.current.port.onmessage = (e) => {
         const int16PcmBuffer = e.data; // ArrayBuffer from the worklet
 
-        // ── VAD: detect speech onset ──────────────────────────────────────
+        // ── VAD: only used for local barge-in detection ───────────────────
+        // Audio is always streamed to Gemini — Gemini's server-side VAD reads
+        // the silence frames to know when you've stopped talking and responds.
+        // Local VAD's only job: instantly kill Gemini's playback the moment
+        // a voice spike is detected so barge-in feels instant.
         const int16View = new Int16Array(int16PcmBuffer);
         let sumSq = 0;
         for (let i = 0; i < int16View.length; i++) sumSq += int16View[i] * int16View[i];
         const rms = Math.sqrt(sumSq / int16View.length);
         const speakingNow = rms > VAD_THRESHOLD;
 
+        // Rising edge only — kill playback immediately on new voice spike
         if (speakingNow && !isSpeakingRef.current) {
-          // User just started speaking — attach a single graph snapshot
           isSpeakingRef.current = true;
-          const canvas = graphContainerRef?.current?.querySelector('canvas');
-          if (canvas && wsRef.current?.readyState === WebSocket.OPEN) {
-            const dataUrl = canvas.toDataURL('image/jpeg', 0.5);
-            const imgBase64 = dataUrl.split(',')[1];
-            wsRef.current.send(JSON.stringify({
-              realtimeInput: { mediaChunks: [{ mimeType: 'image/jpeg', data: imgBase64 }] }
-            }));
-          }
+          interruptGenRef.current += 1;
+          activeSourceNodesRef.current.forEach(n => { try { n.stop(); } catch (_) {} });
+          activeSourceNodesRef.current = [];
+          playbackQueueRef.current = [];
+          nextPlayTimeRef.current = playbackContextRef.current?.currentTime ?? 0;
+          playCounterRef.current = 0;
+          lastSpikeTimeRef.current = performance.now();
+          firstResponseLoggedRef.current = false;
+          console.log('%c[⚡ SPIKE] Voice detected — flushed Gemini playback instantly.', 'color:#f90;font-weight:bold');
+
+          // Frame capture on spike removed to keep session stable (periodic 4s heartbeat covers context)
         } else if (!speakingNow && isSpeakingRef.current) {
           isSpeakingRef.current = false;
         }
-        // ─────────────────────────────────────────────────────────────────
 
-        // Convert to Base64 to send in JSON payload
-        const uint8 = new Uint8Array(int16PcmBuffer);
-        const base64Data = base64js.fromByteArray(uint8);
-
-        if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-          wsRef.current.send(JSON.stringify({
-            realtimeInput: {
-              mediaChunks: [{
-                mimeType: "audio/pcm",
-                data: base64Data
-              }]
-            }
-          }));
-        }
+        // ── Always stream all audio frames to Gemini (including silence) ──
+        // Gemini's VAD needs the silence to detect end-of-turn and respond.
+          if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+            const uint8 = new Uint8Array(int16PcmBuffer);
+            const base64Data = base64js.fromByteArray(uint8);
+            // console.debug(`[Mobile] Sending ${uint8.length} bytes of audio`);
+            wsRef.current.send(JSON.stringify({
+              realtimeInput: {
+                mediaChunks: [{ mimeType: 'audio/pcm;rate=16000', data: base64Data }]
+              }
+            }));
+          }
       };
 
       source.connect(workletNodeRef.current);
@@ -208,6 +376,20 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selec
       workletNodeRef.current.connect(mutedGainNode);
       mutedGainNode.connect(audioContextRef.current.destination);
       
+      // ── PRE-INIT PLAYBACK CONTEXT ──────────────────────────────────────────
+      // Create the 24kHz playback AudioContext here, inside a user-gesture callback,
+      // so Chrome's autoplay policy is satisfied before the first audio chunk arrives.
+      // This eliminates the silent gap / delayed first response.
+      if (!playbackContextRef.current) {
+        playbackContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
+          sampleRate: 24000
+        });
+      }
+      // Resume in case the browser suspended it (tab focus changes, etc.)
+      if (playbackContextRef.current.state === 'suspended') {
+        playbackContextRef.current.resume().catch(console.error);
+      }
+
       setIsRecording(true);
       onStateChange?.('recording');
 
@@ -225,7 +407,7 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selec
       // 2. Send a SHORT intro context — let Gemini give a brief welcome, not a lecture
       if (selectedNode && graphData && wsRef.current?.readyState === WebSocket.OPEN) {
         const neighborNames = buildNeighborNames(selectedNode, graphData);
-        const intro = `[GRAPH CONTEXT] Session started. Current node: "${selectedNode.id}". Neighbors: ${neighborNames}. Give a one-sentence intro and wait.`;
+        const intro = `[GRAPH] At: "${selectedNode.id}". Neighbors: ${neighborNames}. 1-sentence intro.`;
         wsRef.current.send(JSON.stringify({ clientContent: { turns: [{ role: 'user', parts: [{ text: intro }] }], turnComplete: true } }));
       }
 
@@ -270,18 +452,20 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selec
 
       if (wsRef.current?.readyState !== WebSocket.OPEN) return;
 
-      // Send a fresh graph snapshot so Gemini can see the new node visually
-      const canvas = graphContainerRef?.current?.querySelector('canvas');
-      if (canvas) {
-        const dataUrl = canvas.toDataURL('image/jpeg', 0.5);
-        const imgBase64 = dataUrl.split(',')[1];
-        wsRef.current.send(JSON.stringify({
-          realtimeInput: { mediaChunks: [{ mimeType: 'image/jpeg', data: imgBase64 }] }
-        }));
+      // Don't send graph snapshots during video — it would break Gemini's video narration focus
+      if (!isVideoPlayingRef.current) {
+        const canvas = graphContainerRef?.current?.querySelector('canvas');
+        if (canvas) {
+          const dataUrl = canvas.toDataURL('image/jpeg', 0.5);
+          const imgBase64 = dataUrl.split(',')[1];
+          wsRef.current.send(JSON.stringify({
+            realtimeInput: { mediaChunks: [{ mimeType: 'image/jpeg', data: imgBase64 }] }
+          }));
+        }
       }
 
       const neighborNames = buildNeighborNames(selectedNode, graphData);
-      const navMsg = `[GRAPH CONTEXT] User navigated to: "${selectedNode.id}". Direct connections: ${neighborNames}.`;
+      const navMsg = `[GRAPH] At: "${selectedNode.id}". Neighbors: ${neighborNames}.`;
       wsRef.current.send(JSON.stringify({
         clientContent: {
           turns: [{ role: 'user', parts: [{ text: navMsg }] }],
@@ -293,12 +477,110 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selec
     return () => clearTimeout(timer); // Cancel if user moves to another node quickly
   }, [selectedNode, isRecording, graphData]);
 
-  // --- SCREEN (CANVAS) CAPTURE ---
-  // Images are now sent event-driven (on node change + on speech onset via VAD)
-  // instead of on a continuous interval. This avoids flooding the Gemini session.
+  // --- SCREEN (CANVAS) & VIDEO CAPTURE ---
+  // Graph Images are sent event-driven (on node change + on speech onset via VAD) to avoid flooding.
+  // Video frames are sent at 1fps ONLY while a video is genuinely playing (not paused/ended).
+  useEffect(() => {
+    if (!isConnected || !isRecording) return;
+    
+    const interval = setInterval(() => {
+      // Only capture frames when video is actively playing (guarded by ref set via notifyVideoPlaying)
+      if (!isVideoPlayingRef.current) return;
+
+      const videoEl = document.getElementById('active-video-player');
+      if (videoEl && !videoEl.paused && !videoEl.ended) {
+        if (wsRef.current?.readyState === WebSocket.OPEN) {
+          try {
+            // Draw current video frame to an offscreen canvas
+            const canvas = document.createElement('canvas');
+            canvas.width = videoEl.videoWidth || 640;
+            canvas.height = videoEl.videoHeight || 360;
+            const ctx = canvas.getContext('2d');
+            ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
+            
+            const dataUrl = canvas.toDataURL('image/jpeg', 0.5);
+            const imgBase64 = dataUrl.split(',')[1];
+            
+            wsRef.current.send(JSON.stringify({
+              realtimeInput: { mediaChunks: [{ mimeType: 'image/jpeg', data: imgBase64 }] }
+            }));
+          } catch (e) {
+            console.error("Failed to capture video frame:", e);
+          }
+        }
+      } else if (videoEl && (videoEl.paused || videoEl.ended)) {
+        // Sync the ref if video was paused without using our callback (e.g. user clicked pause manually)
+        isVideoPlayingRef.current = false;
+      }
+    }, 500); // 2fps capture rate for Live Video — more frames = better narration sync
+    
+    return () => clearInterval(interval);
+  }, [isConnected, isRecording]);
+
+  // --- PERIODIC CAMERA CAPTURE (Every 2s) ---
+  // Sends the user's real camera feed to Gemini periodically so it always has context.
+  useEffect(() => {
+    if (!isConnected || !isRecording || !cameraActive) return;
+
+    const interval = setInterval(() => {
+      // Don't flood if a video is already occupying the visual focus
+      if (isVideoPlayingRef.current) return;
+
+      if (wsRef.current?.readyState === WebSocket.OPEN && cameraRef?.current) {
+        const frameB64 = cameraRef.current.captureCurrentFrame();
+        if (frameB64) {
+          wsRef.current.send(JSON.stringify({
+            realtimeInput: {
+              mediaChunks: [{ mimeType: 'image/jpeg', data: frameB64 }]
+            }
+          }));
+        }
+      }
+    }, 4000); // Once every 4 seconds (Stability fix: higher frequency causes 1011 error)
+
+    return () => clearInterval(interval);
+  }, [isConnected, isRecording, cameraActive]);
 
   // --- AUDIO RECEIVE AND PLAYBACK ---
   const handleServerMessage = (msg) => {
+    // Mind map data from Gemini tool call — forward to App
+    if (msg.type === 'mind_map') {
+      console.log('[MindMap] Received mind map:', msg.data?.title);
+      onMindMapReceived?.(msg.data);
+      return;
+    }
+
+    if (msg.type === 'isolated_menu') {
+      console.log('[Menu] Received isolated menu:', msg.data?.title);
+      onMenuReceived?.(msg.data);
+      return;
+    }
+
+    if (msg.type === 'isolated_section') {
+      console.log('[Section] Received isolated section:', msg.data?.title);
+      onIsolatedSection?.(msg.data);
+      return;
+    }
+
+    if (msg.type === 'video_status') {
+      console.log('[Video] Status:', msg.status);
+      onVideoStatus?.(msg);
+      return;
+    }
+    
+    if (msg.type === 'video_ready') {
+      console.log('[Video] Ready:', msg.data?.title);
+      // Just show the video — narration will start ONLY when the video actually plays (via notifyVideoPlaying)
+      onVideoReady?.(msg.data);
+      return;
+    }
+    
+    if (msg.type === 'video_error') {
+      console.error('[Video] Error:', msg.message);
+      onVideoError?.(msg.message);
+      return;
+    }
+
     // If Gemini was interrupted by the user speaking, flush playback immediately
     if (msg.interrupted) {
       console.log('[Barge-in] Interrupted signal received — flushing audio buffer.');
@@ -312,10 +594,11 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selec
       });
       activeSourceNodesRef.current = [];
 
-      // Clear the queue and reset the play cursor
+      // Clear the queue and reset the play cursor to NOW so the next response
+      // plays immediately without hitting the +50ms padding in scheduleQueue.
       playbackQueueRef.current = [];
-      isPlayingRef.current = false;
-      nextPlayTimeRef.current = 0;  // CRITICAL: reset so next response plays immediately
+      nextPlayTimeRef.current = playbackContextRef.current?.currentTime ?? 0;
+      playCounterRef.current = 0;   // fix: ensure we don't block subsequent auto-closing
 
       // Keep the AudioContext alive — closing it would require a new one and cause
       // nextPlayTimeRef to be mismatched with the new context's clock
@@ -327,6 +610,11 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selec
 
     // The Python proxy simplifies the structure to { audio: base64, text: string }
     if (msg.audio) {
+      if (!firstResponseLoggedRef.current && lastSpikeTimeRef.current !== null) {
+        const latencyMs = (performance.now() - lastSpikeTimeRef.current).toFixed(0);
+        console.log(`%c[🚀 RESPONSE] First audio back from Gemini: ${latencyMs}ms after spike`, 'color: #4f4; font-weight: bold');
+        firstResponseLoggedRef.current = true;
+      }
       playAudioChunk(msg.audio);
     }
     if (msg.text) {
@@ -334,113 +622,118 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selec
     }
   };
 
+
+
+  // Keep track of exactly when the last chunk finishes so the next begins seamlessly
+  const nextPlayTimeRef = useRef(0);
+  const playCounterRef = useRef(0); // number of chunks currently scheduled/playing
+
+  // Drain the playback queue and schedule everything onto the Web Audio timeline.
+  // The browser handles gapless playback.
+  const scheduleQueue = () => {
+    const ctx = playbackContextRef.current;
+    if (!ctx) return;
+
+    // If nextPlayTime is in the past (start of session or post-interrupt), reset slightly ahead
+    if (nextPlayTimeRef.current < ctx.currentTime) {
+      nextPlayTimeRef.current = ctx.currentTime + 0.01;
+    }
+
+    while (playbackQueueRef.current.length > 0) {
+      const buffer = playbackQueueRef.current.shift();
+      const source = ctx.createBufferSource();
+      source.buffer = buffer;
+      source.connect(ctx.destination);
+
+      // Track so we can hard-stop on barge-in
+      activeSourceNodesRef.current.push(source);
+      playCounterRef.current += 1;
+
+      source.start(nextPlayTimeRef.current);
+      nextPlayTimeRef.current += buffer.duration;
+
+      source.onended = () => {
+        activeSourceNodesRef.current = activeSourceNodesRef.current.filter(n => n !== source);
+        playCounterRef.current -= 1;
+        
+        // If this was the absolute last chunk playing and there are no more chunks queued,
+        // trigger the onAudioFinished callback (used to auto-close the mind map).
+        if (playCounterRef.current === 0 && playbackQueueRef.current.length === 0) {
+          onAudioFinished?.();
+        }
+      };
+    }
+  };
+
   const playAudioChunk = (base64String) => {
     try {
+      // Playback context is pre-initialized in startRecording().
+      // Fallback: create lazily in case audio arrives before recording starts.
       if (!playbackContextRef.current) {
-        // Gemini sends 24kHz audio via the Multimodal Live API
         playbackContextRef.current = new (window.AudioContext || window.webkitAudioContext)({
           sampleRate: 24000
         });
       }
-
-      // 1. Decode base64 to Uint8
-      const binaryString = window.atob(base64String);
-      const len = binaryString.length;
-      const bytes = new Uint8Array(len);
-      for (let i = 0; i < len; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
+      if (playbackContextRef.current.state === 'suspended') {
+        playbackContextRef.current.resume().catch(console.error);
       }
 
-      // 2. Convert raw PCM16 bytes to Float32 AudioBuffer
-      // Since it's 16-bit PCM, 2 bytes = 1 sample
-      const int16Array = new Int16Array(bytes.buffer);
-      const audioBuffer = playbackContextRef.current.createBuffer(
-        1,       // channels
-        int16Array.length, 
-        24000    // sample rate
-      );
+      // 1. Fast base64 → Uint8Array using base64-js (already imported)
+      const bytes = base64js.toByteArray(base64String);
 
+      // 2. Convert raw PCM16 bytes to Float32 AudioBuffer
+      const int16Array = new Int16Array(bytes.buffer, bytes.byteOffset, bytes.byteLength / 2);
+      const audioBuffer = playbackContextRef.current.createBuffer(
+        1,
+        int16Array.length,
+        24000
+      );
       const channelData = audioBuffer.getChannelData(0);
       for (let i = 0; i < int16Array.length; i++) {
         channelData[i] = int16Array[i] / 32768.0;
       }
 
-      // 3. Queue and Play contiguous
+      // 3. Push to queue and schedule immediately
       playbackQueueRef.current.push(audioBuffer);
-      if (!isPlayingRef.current) {
-        playNextInQueue();
-      }
+      scheduleQueue();
 
     } catch (e) {
-      console.error("Audio playback decode error", e);
-    }
-  };
-
-  // Keep track of exactly when the last chunk finishes so the next begins seamlessly
-  const nextPlayTimeRef = useRef(0);
-
-  const playNextInQueue = () => {
-    if (playbackQueueRef.current.length === 0) {
-      isPlayingRef.current = false;
-      return;
-    }
-    
-    isPlayingRef.current = true;
-    const ctx = playbackContextRef.current;
-    if (!ctx) {
-      isPlayingRef.current = false;
-      return;
-    }
-    
-    // If we've lagged or nextPlayTime was reset (post-interrupt), start from now
-    if (nextPlayTimeRef.current < ctx.currentTime) {
-      nextPlayTimeRef.current = ctx.currentTime + 0.02; // 20ms buffer
-    }
-
-    const buffer = playbackQueueRef.current.shift();
-    const source = ctx.createBufferSource();
-    source.buffer = buffer;
-    source.connect(ctx.destination);
-
-    // Track this node so we can hard-stop it on barge-in
-    activeSourceNodesRef.current.push(source);
-    
-    source.start(nextPlayTimeRef.current);
-    nextPlayTimeRef.current += buffer.duration;
-
-    source.onended = () => {
-      // Remove from the tracking list
-      activeSourceNodesRef.current = activeSourceNodesRef.current.filter(n => n !== source);
-
-      if (playbackQueueRef.current.length > 0 && ctx.currentTime >= nextPlayTimeRef.current - 0.1) {
-        playNextInQueue();
-      } else if (playbackQueueRef.current.length === 0) {
-        isPlayingRef.current = false;
-      }
-    };
-    
-    // Recursively schedule everything currently in queue immediately
-    if (playbackQueueRef.current.length > 0) {
-      playNextInQueue();
+      console.error('Audio playback decode error', e);
     }
   };
 
 
   return (
     <div className="live-assistant-panel" style={{ padding: '0.75rem', background: 'transparent', border: 'none' }}>
+      <style>{`
+        @keyframes assistant-pulse {
+          0% { transform: scale(1); opacity: 1; box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4); }
+          50% { transform: scale(1.15); opacity: 0.8; box-shadow: 0 0 0 10px rgba(16, 185, 129, 0); }
+          100% { transform: scale(1); opacity: 1; }
+        }
+      `}</style>
       <div style={{ display: 'flex', alignItems: 'center', gap: '0.5rem', fontSize: '0.85rem', color: '#94a3b8', justifyContent: 'center' }}>
         {error ? (
           <span style={{ color: '#ef4444' }}>❌ {error}</span>
         ) : isRecording ? (
           <>
-            <div style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: '#10b981', animation: 'pulse 2s infinite' }} />
-            <span>Live AI Tutor Active</span>
+            <div style={{ 
+              width: 10, height: 10, borderRadius: '50%', backgroundColor: '#10b981', 
+              animation: 'assistant-pulse 1.5s infinite ease-in-out' 
+            }} />
+            <span style={{ color: '#10b981', fontWeight: '500' }}>Live AI Tutor Listening...</span>
           </>
         ) : isConnected ? (
-          <>
-            <div style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: '#3b82f6' }} />
-            <span>Activating mic...</span>
-          </>
+          <button 
+            onClick={startRecording}
+            style={{ 
+              background: '#3b82f6', color: '#fff', border: 'none', 
+              padding: '4px 12px', borderRadius: '4px', cursor: 'pointer',
+              fontSize: '0.8rem', fontWeight: 'bold'
+            }}
+          >
+            Start Mic
+          </button>
         ) : (
           <>
             <div style={{ width: 8, height: 8, borderRadius: '50%', backgroundColor: '#f59e0b' }} />
@@ -450,6 +743,6 @@ const LiveAssistant = ({ onStateChange, graphContainerRef, onTextReceived, selec
       </div>
     </div>
   );
-};
+});
 
 export default LiveAssistant;

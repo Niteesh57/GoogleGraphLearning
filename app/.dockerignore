@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+.git/
+.gitignore
+gemini_errors.log
+check.txt
+list_models.py
+models_bidi.txt
+models_output.txt
+.generated_videos/
+*.log
+venv

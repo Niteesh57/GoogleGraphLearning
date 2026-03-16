@@ -81,8 +81,14 @@ const GraphView = forwardRef(({ data, onNodeSelect, selectedNode, width, height 
           const sid = typeof link.source === 'object' ? link.source.id : link.source;
           const tid = typeof link.target === 'object' ? link.target.id : link.target;
           return (sid === selectedNode.id || tid === selectedNode.id)
-            ? 'rgba(251,146,60,0.9)'   // orange highlight for connected links
-            : 'rgba(100,116,139,0.25)';
+            ? 'rgba(251,146,60,0.95)'   // orange highlight for connected links
+            : 'rgba(100,116,139,0.3)';
+        }}
+        linkWidth={link => {
+          if (!selectedNode) return 1.5;
+          const sid = typeof link.source === 'object' ? link.source.id : link.source;
+          const tid = typeof link.target === 'object' ? link.target.id : link.target;
+          return (sid === selectedNode.id || tid === selectedNode.id) ? 4 : 1.5;
         }}
         // ── Node rendering ───────────────────────────────────────
         nodeCanvasObject={(node, ctx, globalScale) => {

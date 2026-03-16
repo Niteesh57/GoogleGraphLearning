@@ -2,10 +2,21 @@ import { useEffect, useRef, useState } from 'react';
 
 const smooth = (prev, next) => prev * 0.7 + next * 0.3;
 
-export default function GestureController({ onSwipe }) {
+export default function GestureController({ onSwipe, isActive: propActive, onActiveChange, sharedCamera }) {
   const videoRef = useRef(null);
   const canvasRef = useRef(null);
-  const [isActive, setIsActive] = useState(false);
+  
+  // Use local state if no prop is provided, otherwise sync with prop
+  const [internalActive, setInternalActive] = useState(false);
+  const isActive = propActive !== undefined ? propActive : internalActive;
+
+  const toggleActive = () => {
+    if (onActiveChange) {
+      onActiveChange(!isActive);
+    } else {
+      setInternalActive(!isActive);
+    }
+  };
 
   // Keep latest values accessible inside the MediaPipe loop without restarting it
   const onSwipeRef = useRef(onSwipe);
@@ -41,7 +52,10 @@ export default function GestureController({ onSwipe }) {
       const canvas = canvasRef.current;
       const ctx = canvas.getContext('2d');
       ctx.save();
-      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      // Only clear if we are NOT drawing the shared video ourselves
+      if (!(sharedCamera && sharedCamera.current && sharedCamera.current.videoElement)) {
+          ctx.clearRect(0, 0, canvas.width, canvas.height);
+      }
 
       if (!results.multiHandLandmarks?.length) {
         state.current.prevCursorX = null;
@@ -55,9 +69,8 @@ export default function GestureController({ onSwipe }) {
       window.drawConnectors(ctx, hand, window.HAND_CONNECTIONS, { color: '#00FF00', lineWidth: 1.5 });
       window.drawLandmarks(ctx, hand, { color: '#FF0000', lineWidth: 1, radius: 1.5 });
 
-      // Index fingertip (8) = cursor; Thumb (4) = pinch partner
+      // Index fingertip (8) = cursor
       const index = hand[8];
-      const thumb = hand[4];
 
       // Mirror X so moving right feels like moving right
       const rawX = (1 - index.x) * canvas.width;
@@ -77,61 +90,89 @@ export default function GestureController({ onSwipe }) {
       ctx.stroke();
       ctx.restore();
 
-      // ── GRAPH PANNING REMOVED ──────────────────────────────────────────────
-      // ── PINCH ZOOM REMOVED ──────────────────────────────────────────
-
       // ── NODE FOCUS: DIRECTIONAL SWIPE NAVIGATION ───────────────────────────
       if (state.current.prevCursorX !== null) {
         const dx = cx - state.current.prevCursorX;
         const dy = cy - state.current.prevCursorY;
 
         // Require a firm swipe gesture to trigger navigation
-        if (Math.abs(dx) > 15 || Math.abs(dy) > 15) { // tuned swipe threshold
-          // Calculate angle of swipe
+        if (Math.abs(dx) > 15 || Math.abs(dy) > 15) { 
           const swipeAngle = Math.atan2(dy, dx);
           let direction = "NONE";
 
-          // pi/4 = 45 degrees. Classify into 4 quadrants
           if (swipeAngle > -Math.PI / 4 && swipeAngle <= Math.PI / 4) direction = "RIGHT";
           else if (swipeAngle > Math.PI / 4 && swipeAngle <= 3 * Math.PI / 4) direction = "DOWN";
           else if (swipeAngle < -Math.PI / 4 && swipeAngle >= -3 * Math.PI / 4) direction = "UP";
           else direction = "LEFT";
 
-          // Call the central navigation function in App.jsx
           onSwipeRef.current?.(direction);
           
-          // "Consume" the swipe by resetting the tracking coordinates so it doesn't trigger repeatedly
           state.current.prevCursorX = cx;
           state.current.prevCursorY = cy;
         }
       }
 
-      // Only update previous position if we didn't just consume a swipe
       if (Math.abs(cx - (state.current.prevCursorX||cx)) < 15 && Math.abs(cy - (state.current.prevCursorY||cy)) < 15) {
         state.current.prevCursorX = cx;
         state.current.prevCursorY = cy;
       }
     });
 
-    const camera = new window.Camera(videoRef.current, {
-      onFrame: async () => {
-        if (!destroyed) await hands.send({ image: videoRef.current });
-      },
-      width: 320,
-      height: 240
-    });
+    let cameraInstance = null;
+    let rafId = null;
 
-    camera.start();
+    if (sharedCamera && sharedCamera.current && sharedCamera.current.videoElement) {
+      const sharedVideo = sharedCamera.current.videoElement;
+      
+      const processFrame = async () => {
+         if (destroyed) return;
+         if (sharedVideo.readyState >= 2 && !sharedVideo.paused && !sharedVideo.ended) {
+            try {
+               // Draw the shared video onto the canvas first (scaled and transformed)
+               if (canvasRef.current) {
+                 const ctx = canvasRef.current.getContext('2d');
+                 ctx.save();
+                 ctx.scale(-1, 1); // mirror
+                 ctx.drawImage(sharedVideo, -canvasRef.current.width, 0, canvasRef.current.width, canvasRef.current.height);
+                 ctx.restore();
+               }
+               // Send to MediaPipe
+               await hands.send({ image: sharedVideo });
+            } catch (e) {
+               console.error("Hands send error", e);
+            }
+         }
+         if (!destroyed) {
+           rafId = requestAnimationFrame(processFrame);
+         }
+      };
+      
+      // Delay slightly so video has time to play
+      setTimeout(() => {
+         if (!destroyed) rafId = requestAnimationFrame(processFrame);
+      }, 500);
+
+    } else {
+      cameraInstance = new window.Camera(videoRef.current, {
+        onFrame: async () => {
+          if (!destroyed) await hands.send({ image: videoRef.current });
+        },
+        width: 320,
+        height: 240
+      });
+      cameraInstance.start();
+    }
 
     return () => {
       destroyed = true;
       state.current.prevCursorX = null;
       state.current.prevCursorY = null;
       state.current.prevPinchDist = null;
-      camera.stop();
+      if (cameraInstance) cameraInstance.stop();
+      if (rafId) cancelAnimationFrame(rafId);
       try { hands.close(); } catch (e) { }
     };
-  }, [isActive]); // fgRef, graphData, onNodeFocus never go in here — handled via refs above
+  }, [isActive, sharedCamera]); 
 
   return (
     <div className="input-panel-card gesture-card">
@@ -139,7 +180,7 @@ export default function GestureController({ onSwipe }) {
       <div className="gesture-controls">
         <button
           className={`mic-button ${isActive ? 'active' : ''}`}
-          onClick={() => setIsActive(a => !a)}
+          onClick={toggleActive}
           style={{ marginBottom: '0.5rem' }}
         >
           {isActive ? '✋ Stop Gesture Mode' : '🖐 Start Gesture Mode'}
@@ -151,15 +192,17 @@ export default function GestureController({ onSwipe }) {
         </div>
       )}
       <div style={{ position: 'relative', width: '100%', aspectRatio: '4/3', display: isActive ? 'block' : 'none' }}>
-        <video
-          ref={videoRef}
-          style={{ position: 'absolute', width: '100%', height: '100%', objectFit: 'cover', transform: 'scaleX(-1)' }}
-        />
+        {!(sharedCamera && sharedCamera.current && sharedCamera.current.videoElement) && (
+          <video
+            ref={videoRef}
+            style={{ position: 'absolute', width: '100%', height: '100%', objectFit: 'cover', transform: 'scaleX(-1)' }}
+          />
+        )}
         <canvas
           ref={canvasRef}
           width={320}
           height={240}
-          style={{ position: 'absolute', width: '100%', height: '100%', zIndex: 1, transform: 'scaleX(-1)' }}
+          style={{ position: 'absolute', width: '100%', height: '100%', zIndex: 1 }}
         />
       </div>
     </div>

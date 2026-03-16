@@ -1,13 +1,13 @@
 import networkx as nx
 import json
-from sentence_transformers import SentenceTransformer
 from scipy.spatial.distance import cosine
 from io import BytesIO
 from pdfminer.high_level import extract_text
 from google import genai
 from pydantic import BaseModel, Field
-from typing import List
+from typing import List, Dict
 import os
+from app.services.embedding_service import embedding_service
 
 class Edge(BaseModel):
     source: str
@@ -21,9 +21,9 @@ class KnowledgeGraphSchema(BaseModel):
 class KnowledgeEngine:
     def __init__(self):
         self.G = nx.Graph()
-        # Ensure we have our model loaded for embedding similarity
-        self.embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-        self.client = genai.Client()
+        # Cache for node embeddings to avoid redundant API calls
+        self.embedding_cache: Dict[str, List[float]] = {}
+        self.client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
     def extract_text_from_pdf(self, pdf_bytes: bytes) -> str:
         text = extract_text(BytesIO(pdf_bytes))
@@ -48,17 +48,32 @@ class KnowledgeEngine:
         )
         return json.loads(response.text)
 
-    def _embed(self, text: str):
-        return self.embed_model.encode(text)
+    def _get_embedding(self, text: str) -> List[float]:
+        """Fetch embedding from cache or API."""
+        if text in self.embedding_cache:
+            return self.embedding_cache[text]
+        
+        embeddings = embedding_service.generate_embeddings([text])
+        if embeddings:
+            self.embedding_cache[text] = embeddings[0]
+            return embeddings[0]
+        return []
 
     def _merge_node(self, new_node: str) -> str:
         """Finds if a semantically similar node exists in the graph and returns it, else returns new_node."""
         if not self.G.nodes:
+            # Still get embedding to cache it
+            self._get_embedding(new_node)
             return new_node
             
-        new_emb = self._embed(new_node)
+        new_emb = self._get_embedding(new_node)
+        if not new_emb:
+            return new_node
+            
         for existing_node in self.G.nodes:
-            existing_emb = self._embed(existing_node)
+            existing_emb = self._get_embedding(existing_node)
+            if not existing_emb:
+                continue
             # cosine() returns distance. Similarity = 1 - distance.
             sim = 1 - cosine(new_emb, existing_emb)
             if sim > 0.85:
@@ -67,8 +82,9 @@ class KnowledgeEngine:
 
     def update_graph(self, concepts: dict):
         # Merge and add nodes
+        nodes = concepts.get("nodes", [])
         node_mapping = {} # maps the extracted node name to the canonical (merged) node name in the graph
-        for node in concepts.get("nodes", []):
+        for node in nodes:
             merged_name = self._merge_node(node)
             node_mapping[node] = merged_name
             if merged_name not in self.G:
